@@ -1,6 +1,7 @@
 import logging
 import sqlite3
 import os
+import json  # <--- اضافه شده برای خواندن کانفیگ
 import asyncio
 import time
 import warnings
@@ -38,8 +39,28 @@ from telegram.ext import (
 # ==============================================================================
 # ⚙️ CONFIGURATION & CONSTANTS
 # ==============================================================================
-TOKEN = '8089255042:AAHHqh1zJFHbj6_c5QUTPv_6thKHgNCg2NI'  # ⚠️ TOKEN
-SUPER_ADMIN_ID = 585214295                               # ⚠️ ADMIN ID
+CONFIG_FILE = 'sonar_config.json'
+
+# --- تلاش برای خواندن توکن و آیدی ادمین از فایل JSON ---
+try:
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r') as f:
+            config = json.load(f)
+            TOKEN = config.get('bot_token', 'Not_Set')
+            try:
+                SUPER_ADMIN_ID = int(config.get('admin_id', 0))
+            except:
+                SUPER_ADMIN_ID = 0
+    else:
+        # مقادیر پیش‌فرض (تا زمانی که فایل کانفیگ توسط install.sh ساخته شود)
+        TOKEN = 'TOKEN_NOT_SET'
+        SUPER_ADMIN_ID = 0
+        print(f"⚠️ Config file ({CONFIG_FILE}) not found. Please run install.sh")
+except Exception as e:
+    print(f"❌ Error loading config: {e}")
+    TOKEN = 'ERROR'
+    SUPER_ADMIN_ID = 0
+
 DEFAULT_INTERVAL = 60
 DOWN_RETRY_LIMIT = 3
 DB_NAME = 'sonar_ultra_pro.db'
@@ -464,10 +485,8 @@ class ServerMonitor:
 
     @staticmethod
     def make_bar(percentage, length=10):
-        # --- اصلاح شده برای جلوگیری از کرش ---
         if not isinstance(percentage, (int, float)):
             percentage = 0
-        # ------------------------------------
         blocks = "▏▎▍▌▋▊▉█"
         if percentage < 0: percentage = 0
         if percentage > 100: percentage = 100
@@ -549,24 +568,12 @@ class ServerMonitor:
         return ServerMonitor.run_remote_command(ip, port, user, password, cmd, timeout=300)
 
     @staticmethod
-    def repo_update(ip, port, user, password):
-        # فقط آپدیت لیست مخازن و آپگرید بسته‌های امنیتی (Safe Upgrade)
-        cmd = (
-            "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && "
-            "sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
-        )
-        return ServerMonitor.run_remote_command(ip, port, user, password, cmd, timeout=300)
+    def run_speedtest(ip, port, user, password):
+        return ServerMonitor.run_remote_command(ip, port, user, password, "speedtest-cli --simple", timeout=90)
 
     @staticmethod
-    def full_system_update(ip, port, user, password):
-        # ارتقاء کامل و سنگین (Full Dist Upgrade) با حذف خودکار فایل‌های اضافه
-        cmd = (
-            "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && "
-            "sudo DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' && "
-            "sudo DEBIAN_FRONTEND=noninteractive apt-get autoremove -y && "
-            "sudo DEBIAN_FRONTEND=noninteractive apt-get clean"
-        )
-        return ServerMonitor.run_remote_command(ip, port, user, password, cmd, timeout=900)
+    def clear_cache(ip, port, user, password):
+        return ServerMonitor.run_remote_command(ip, port, user, password, "sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'", timeout=30)
 
     @staticmethod
     def set_dns(ip, port, user, password, dns_type):
@@ -580,12 +587,22 @@ class ServerMonitor:
 
     @staticmethod
     def full_system_update(ip, port, user, password):
-        cmd = "sudo apt update && sudo DEBIAN_FRONTEND=noninteractive apt full-upgrade -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' && sudo apt autoremove -y && sudo apt clean"
-        return ServerMonitor.run_remote_command(ip, port, user, password, cmd, timeout=600)
+        # ارتقاء کامل و سنگین (Full Dist Upgrade) با حذف خودکار فایل‌های اضافه
+        cmd = (
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && "
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' && "
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get autoremove -y && "
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get clean"
+        )
+        return ServerMonitor.run_remote_command(ip, port, user, password, cmd, timeout=900)
 
     @staticmethod
     def repo_update(ip, port, user, password):
-        cmd = "sudo apt update && sudo DEBIAN_FRONTEND=noninteractive apt upgrade -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold'"
+        # فقط آپدیت لیست مخازن و آپگرید بسته‌های امنیتی (Safe Upgrade)
+        cmd = (
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && "
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
+        )
         return ServerMonitor.run_remote_command(ip, port, user, password, cmd, timeout=300)
 
     @staticmethod
@@ -2440,7 +2457,12 @@ def main():
     app.add_handler(CallbackQueryHandler(send_instant_channel_report, pattern='^send_instant_report$'))
 
     if app.job_queue:
+        # جاب روزانه: بررسی انقضا ساعت ۸:۳۰ صبح
         app.job_queue.run_daily(check_expiry_job, time=dt.time(hour=8, minute=30, second=0))
+        
+        # جاب تکرار شونده: مانیتورینگ سرورها
+        # interval: فاصله زمانی بین اجراها (ثانیه)
+        # first: اولین اجرا چند ثانیه بعد از استارت باشد
         app.job_queue.run_repeating(global_monitor_job, interval=DEFAULT_INTERVAL, first=10)
     else:
         logger.error("JobQueue not available. Install python-telegram-bot[job-queue]")
