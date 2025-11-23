@@ -56,71 +56,41 @@ fi
 function install_bot() {
     show_header
     
-    # Stop existing service
     if systemctl is-active --quiet $SERVICE_NAME; then
         systemctl stop $SERVICE_NAME
     fi
 
-    # Installation Process with Gauge
     {
-        echo 10
-        echo "XXX\nUpdating system packages...\nXXX"
-        apt-get update -y > /dev/null 2>&1
+        echo 10; echo "XXX\nUpdating system packages...\nXXX"; apt-get update -y > /dev/null 2>&1
+        echo 30; echo "XXX\nInstalling Python, Git & Pip...\nXXX"; apt-get install -y python3 python3-pip python3-venv git curl > /dev/null 2>&1
         
-        echo 30
-        echo "XXX\nInstalling Python, Git & Pip...\nXXX"
-        apt-get install -y python3 python3-pip python3-venv git curl > /dev/null 2>&1
+        echo 50; echo "XXX\nPreparing directory...\nXXX"
+        if [ -f "$INSTALL_DIR/sonar_ultra_pro.db" ]; then cp "$INSTALL_DIR/sonar_ultra_pro.db" /tmp/sonar_backup.db; fi
+        rm -rf "$INSTALL_DIR"; mkdir -p "$INSTALL_DIR"
         
-        echo 50
-        echo "XXX\nPreparing directory...\nXXX"
-        # Preserve database if exists
-        if [ -f "$INSTALL_DIR/sonar_ultra_pro.db" ]; then
-            cp "$INSTALL_DIR/sonar_ultra_pro.db" /tmp/sonar_backup.db
-        fi
-        
-        rm -rf "$INSTALL_DIR"
-        mkdir -p "$INSTALL_DIR"
-        
-        echo 60
-        echo "XXX\nDownloading source code...\nXXX"
+        echo 60; echo "XXX\nDownloading source code...\nXXX"
         if ! git clone "$REPO_URL" "$INSTALL_DIR" > /dev/null 2>&1; then
-            # Fallback to CURL
             curl -s -o "$INSTALL_DIR/bot.py" "$RAW_URL/bot.py"
             curl -s -o "$INSTALL_DIR/requirements.txt" "$RAW_URL/requirements.txt"
         fi
 
-        # Restore database
-        if [ -f "/tmp/sonar_backup.db" ]; then
-            mv /tmp/sonar_backup.db "$INSTALL_DIR/sonar_ultra_pro.db"
-        fi
+        if [ -f "/tmp/sonar_backup.db" ]; then mv /tmp/sonar_backup.db "$INSTALL_DIR/sonar_ultra_pro.db"; fi
 
-        echo 80
-        echo "XXX\nCreating Virtual Environment...\nXXX"
+        echo 80; echo "XXX\nCreating Virtual Environment...\nXXX"
         python3 -m venv "$INSTALL_DIR/venv"
         source "$INSTALL_DIR/venv/bin/activate"
         pip install --upgrade pip > /dev/null 2>&1
         
-        echo 90
-        echo "XXX\nInstalling Python Libraries...\nXXX"
-        if [ -f "$INSTALL_DIR/requirements.txt" ]; then
-            pip install -r "$INSTALL_DIR/requirements.txt" > /dev/null 2>&1
-        else
-            pip install python-telegram-bot[job-queue] requests paramiko cryptography jdatetime matplotlib > /dev/null 2>&1
-        fi
+        echo 90; echo "XXX\nInstalling Python Libraries...\nXXX"
+        pip install -r "$INSTALL_DIR/requirements.txt" > /dev/null 2>&1
         
         echo 100
     } | whiptail --title "Installation" --gauge "Installing Sonar Radar..." 8 60 0
 
-    # Verify Download
-    if [ ! -f "$INSTALL_DIR/bot.py" ]; then
-        whiptail --msgbox "❌ Error: bot.py download failed." 8 45
-        return
-    fi
+    if [ ! -f "$INSTALL_DIR/bot.py" ]; then whiptail --msgbox "❌ Error: bot.py download failed." 8 45; return; fi
 
-    # Configure Bot
     configure_bot_gui "install"
 
-    # Create Systemd Service
     cat <<EOF > /etc/systemd/system/$SERVICE_NAME.service
 [Unit]
 Description=Sonar Radar Ultra Pro Bot
@@ -138,7 +108,6 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-    # Enable Service
     systemctl daemon-reload
     systemctl enable $SERVICE_NAME > /dev/null 2>&1
     systemctl restart $SERVICE_NAME
@@ -156,28 +125,25 @@ function update_bot() {
     systemctl stop $SERVICE_NAME
     
     {
-        echo 20
-        echo "XXX\nPulling changes from GitHub...\nXXX"
+        echo 20; echo "XXX\nPulling changes from GitHub...\nXXX"
         cd "$INSTALL_DIR" || exit
         
-        # Check if it's a git repo
         if [ -d ".git" ]; then
-            git fetch --all
-            git reset --hard origin/main
-            git pull
+            git fetch --all > /dev/null 2>&1
+            git reset --hard origin/main > /dev/null 2>&1
+            git pull > /dev/null 2>&1
         else
-            # If installed via CURL fallback, re-download files
             curl -s -o "$INSTALL_DIR/bot.py" "$RAW_URL/bot.py"
             curl -s -o "$INSTALL_DIR/requirements.txt" "$RAW_URL/requirements.txt"
         fi
         
-        echo 60
-        echo "XXX\nUpdating dependencies...\nXXX"
-        source "$INSTALL_DIR/venv/bin/activate"
-        pip install -r requirements.txt > /dev/null 2>&1
+        echo 60; echo "XXX\nUpdating dependencies...\nXXX"
+        if [ -d "venv" ]; then
+            source "venv/bin/activate"
+            pip install -r requirements.txt > /dev/null 2>&1
+        fi
         
-        echo 90
-        echo "XXX\nRestarting Service...\nXXX"
+        echo 90; echo "XXX\nRestarting Service...\nXXX"
         systemctl restart $SERVICE_NAME
         echo 100
     } | whiptail --title "Update" --gauge "Updating Sonar Radar..." 8 60 0
@@ -190,10 +156,7 @@ function configure_bot_gui() {
     MODE=$1
     CONFIG_FILE="$INSTALL_DIR/bot.py"
 
-    if [ ! -f "$CONFIG_FILE" ]; then
-        whiptail --msgbox "❌ bot.py not found. Install first." 8 45
-        return
-    fi
+    if [ ! -f "$CONFIG_FILE" ]; then whiptail --msgbox "❌ bot.py not found. Install first." 8 45; return; fi
 
     TOKEN=$(whiptail --inputbox "🤖 Enter Telegram Bot TOKEN:" 10 60 --title "Bot Configuration" 3>&1 1>&2 2>&3)
     if [ $? -ne 0 ]; then return; fi
@@ -201,7 +164,6 @@ function configure_bot_gui() {
     ADMIN_ID=$(whiptail --inputbox "👤 Enter Super Admin Numeric ID:" 10 60 --title "Bot Configuration" 3>&1 1>&2 2>&3)
     if [ $? -ne 0 ]; then return; fi
 
-    # Inject into bot.py using sed
     sed -i "s/TOKEN = .*/TOKEN = '$TOKEN'/" "$CONFIG_FILE"
     sed -i "s/SUPER_ADMIN_ID = .*/SUPER_ADMIN_ID = $ADMIN_ID/" "$CONFIG_FILE"
 
@@ -247,9 +209,10 @@ function check_status() {
 while true; do
     show_header
     
+    # MENU DEFINITION - CHECK THIS PART CAREFULLY
     OPTION=$(whiptail --title "🚀 Sonar Radar Manager" --menu "Select an option:" 20 70 11 \
-    "1" "📥 Install / Re-install (Reset)" \
-    "2" "🔄 Update Source Code (Fast)" \
+    "1" "📥 Install / Re-install (Reset DB if needed)" \
+    "2" "🔄 Update Source Code (Keep DB)" \
     "3" "⚙️ Configure Token & Admin ID" \
     "4" "⏯️ Restart Bot" \
     "5" "🛑 Stop Bot" \
@@ -258,7 +221,8 @@ while true; do
     "8" "🗑️ Uninstall Completely" \
     "9" "❌ Exit" 3>&1 1>&2 2>&3)
 
-    if [ $? -ne 0 ]; then exit; fi
+    exitstatus=$?
+    if [ $exitstatus != 0 ]; then exit; fi
 
     case $OPTION in
         1) install_bot ;;
