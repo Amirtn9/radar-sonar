@@ -37,8 +37,8 @@ from telegram.ext import (
 # ==============================================================================
 # ⚙️ CONFIGURATION & CONSTANTS
 # ==============================================================================
-TOKEN = 'TOKEN'  # ⚠️ TOKEN
-SUPER_ADMIN_ID = ID-TELEGTAM                               # ⚠️ ADMIN ID
+TOKEN = '8089255042:AAHHqh1zJFHbj6_c5QUTPv_6thKHgNCg2NI'  # ⚠️ TOKEN
+SUPER_ADMIN_ID = 585214295                               # ⚠️ ADMIN ID
 DEFAULT_INTERVAL = 60
 DOWN_RETRY_LIMIT = 3
 DB_NAME = 'sonar_ultra_pro.db'
@@ -108,7 +108,8 @@ class Security:
     def decrypt(self, txt):
         try:
             return self.cipher.decrypt(txt.encode()).decode()
-        except:
+        except Exception as e: # Fix 3: اضافه کردن لاگ برای خطای رمزگشایی به جای صرفاً نادیده گرفتن
+            logger.error(f"Decryption failed for data: {txt[:10]}... Error: {e}") 
             return "" # Handle decryption errors gracefully
 
 
@@ -117,13 +118,17 @@ class Database:
         self.lock = threading.Lock()
         self.conn = sqlite3.connect(DB_NAME, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute('PRAGMA journal_mode=WAL;')
+        try: # Fix 1: اضافه کردن Try/Except برای اجرای PRAGMA تا در صورت خراب بودن دیتابیس (Malformed DB) کرش نکند.
+            self.conn.execute('PRAGMA journal_mode=WAL;')
+        except sqlite3.DatabaseError as e:
+            logger.error(f"Error setting PRAGMA journal_mode=WAL: {e}")
         self.create_tables()
         self.migrate()
 
     def close(self):
         if self.conn:
             self.conn.close()
+            self.conn = None # Fix 2: اتصال را به صراحت None می‌کنیم تا در هنگام Re-init مطمئن شویم که مرجع قبلی آزاد شده است.
 
     def create_tables(self):
         with self.lock:
@@ -258,18 +263,21 @@ class Database:
     def delete_group(self, group_id, owner_id):
         with self.lock:
             self.conn.execute('DELETE FROM groups WHERE id = ? AND owner_id = ?', (group_id, owner_id))
-            self.conn.execute('UPDATE servers SET group_id = NULL WHERE group_id = ?', (group_id,))
+            # Fix 5: اضافه کردن شرط owner_id برای جلوگیری از به روزرسانی ناخواسته سرورهای کاربران دیگر
+            self.conn.execute('UPDATE servers SET group_id = NULL WHERE group_id = ? AND owner_id = ?', (group_id, owner_id)) 
             self.conn.commit()
 
     # --- Server Methods ---
     def add_server(self, owner_id, group_id, data):
-        user = self.get_user(owner_id)
-        current_servers = len(self.get_all_user_servers(owner_id))
-        if user and owner_id != SUPER_ADMIN_ID:
-            if current_servers >= user['server_limit']:
-                raise Exception("Server Limit Reached")
+        # Fix 6: انتقال منطق چک کردن محدودیت سرور به داخل قفل (Lock) برای جلوگیری از Race Condition
         g_id = group_id if group_id != 0 else None
         with self.lock:
+            user = self.get_user(owner_id)
+            current_servers = len(self.get_all_user_servers(owner_id))
+            if user and owner_id != SUPER_ADMIN_ID:
+                if current_servers >= user['server_limit']:
+                    raise Exception("Server Limit Reached")
+            
             self.conn.execute(
                 'INSERT INTO servers (owner_id, group_id, name, ip, port, username, password, expiry_date) VALUES (?,?,?,?,?,?,?,?)',
                 (owner_id, g_id, data['name'], data['ip'], data['port'], data['username'], data['password'], data.get('expiry_date'))
@@ -716,7 +724,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_access, msg = db.check_access(user_id)
 
     if not has_access:
-        await update.message.reply_text(f"⛔️ **دسترسی مسدود است**\nعلت: {msg}")
+        # Fix 7: استفاده از effective_message برای ارسال پیام دسترسی مسدود، تا هم برای دستورات (Command) و هم برای Callback Query ها کار کند.
+        await update.effective_message.reply_text(f"⛔️ **دسترسی مسدود است**\nعلت: {msg}", parse_mode='Markdown')
         return
     
     remaining = f"{msg} روز" if isinstance(msg, int) else "♾ نامحدود"
