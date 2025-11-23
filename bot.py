@@ -38,8 +38,8 @@ from telegram.ext import (
 # ==============================================================================
 # ⚙️ CONFIGURATION & CONSTANTS
 # ==============================================================================
-TOKEN = '8089255042:AAHHqh1zJFHbj6_c5QUTPv_6thKHgNCg2NI'  # ⚠️ TOKEN
-SUPER_ADMIN_ID = 585214295                               # ⚠️ ADMIN ID
+TOKEN = 'tokentelegram'  # ⚠️ TOKEN
+SUPER_ADMIN_ID = 0912000000                               # ⚠️ ADMIN ID
 DEFAULT_INTERVAL = 60
 DOWN_RETRY_LIMIT = 3
 DB_NAME = 'sonar_ultra_pro.db'
