@@ -70,6 +70,7 @@ SERVER_FAILURE_COUNTS = {}
 LAST_REPORT_CACHE = {}
 CPU_ALERT_TRACKER = {}
 DAILY_REPORT_USAGE = {}
+UPTIME_MILESTONE_TRACKER = set() # برای جلوگیری از تکرار پیام تبریک
 
 # --- Conversation States ---
 (
@@ -194,7 +195,8 @@ class Database:
         user = self.get_user(user_id)
         if not user: return 0 
         new_plan = 1 if user['plan_type'] == 0 else 0
-        new_limit = 50 if new_plan == 1 else 2
+        # تغییر: لیمیت پریمیوم به 10 سرور تغییر یافت
+        new_limit = 10 if new_plan == 1 else 2
         with self.get_connection() as conn:
             conn.execute('UPDATE users SET plan_type = ?, server_limit = ? WHERE user_id = ?', (new_plan, new_limit, user_id))
             conn.commit()
@@ -796,7 +798,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     full_name = update.effective_user.full_name
     context.user_data.clear()
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, db.add_or_update_user, user_id, full_name, 180)
+    # تغییر: مدت زمان پیش‌فرض اشتراک رایگان به 60 روز تغییر یافت
+    await loop.run_in_executor(None, db.add_or_update_user, user_id, full_name, 60)
     has_access, msg = await loop.run_in_executor(None, db.check_access, user_id)
     
     if not has_access:
@@ -817,9 +820,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id == SUPER_ADMIN_ID: 
         kb.insert(0, [InlineKeyboardButton("🤖 مدیریت ربات", callback_data='admin_panel_main')])
 
+    # تغییر: اضافه شدن ایموجی خفاش به متن استارت
     txt = (
         f"👋 **درود {full_name} عزیز**\n"
-        f"🚀 **Sonar Radar Ultra Pro**\n"
+        f"🦇 **Sonar Radar Ultra Pro**\n"
         f"➖➖➖➖➖➖➖➖➖➖\n"
         f"👤 شناسه کاربری: `{user_id}`\n"
         f"📅 اعتبار اشتراک: `{remaining}`\n"
@@ -1020,7 +1024,7 @@ async def admin_user_actions(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ADMIN_SET_TIME_MANUAL
     elif action == 'toggleplan':
         new_plan = db.toggle_user_plan(target_id)
-        msg = "✅ کاربر به پریمیوم ارتقا یافت (لیمیت: 50)" if new_plan == 1 else "⬇️ کاربر به عادی تغییر یافت (لیمیت: 2)"
+        msg = "✅ کاربر به پریمیوم ارتقا یافت (لیمیت: 10)" if new_plan == 1 else "⬇️ کاربر به عادی تغییر یافت (لیمیت: 2)"
         try: await update.callback_query.answer(msg, show_alert=True)
         except: pass
         await admin_user_manage(update, context, user_id=target_id)
@@ -1372,7 +1376,7 @@ async def status_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tasks.append(fake())
     
     results = await asyncio.gather(*tasks)
-    txt = f"📊 **داشبورد وضعیت شبکه**\n📆 `{get_jalali_str()}`\n➖➖➖➖➖➖➖➖➖➖\n\n"
+    txt = f"📊 **داشبورد وضعیت شبکه** 🦇\n📆 `{get_jalali_str()}`\n➖➖➖➖➖➖➖➖➖➖\n\n"
     active_count = sum(1 for r in results if isinstance(r, dict) and r['status'] == 'Online')
     txt += f"🟢 **سرورهای آنلاین:** `{active_count}`\n🔴 **آفلاین/خاموش:** `{len(servers) - active_count}`\n\n"
     
@@ -2355,6 +2359,31 @@ async def process_single_user(context, uid, servers, settings, loop):
         if r.get('status') == 'Online':
             db.add_server_stat(s_info['id'], r.get('cpu', 0), r.get('ram', 0))
             
+            # --- بخش جدید: بررسی و تشویق آپتایم بالا ---
+            uptime_days = int(r.get('uptime_sec', 0) // 86400)
+            milestones = [15, 30, 60, 90, 120, 150, 180, 365]
+            
+            if uptime_days in milestones:
+                cache_key = f"{uid}_{s_info['id']}_{uptime_days}"
+                if cache_key not in UPTIME_MILESTONE_TRACKER:
+                    UPTIME_MILESTONE_TRACKER.add(cache_key)
+                    
+                    # متن‌های تشویقی مختلف برای بازه‌های زمانی
+                    congrats_msg = ""
+                    if uptime_days == 15:
+                        congrats_msg = f"🎉 **آفرین! سرور `{s_info['name']}` به ۱۵ روز آپتایم رسید!**\nشروع خوبیه، همین فرمون برو جلو! 🦇🔥"
+                    elif uptime_days == 30:
+                        congrats_msg = f"🏆 **تبریک! سرور `{s_info['name']}` یک ماهه که بیداره!**\nپایداری یعنی این! خسته نباشی ☕️🦇"
+                    elif uptime_days == 60:
+                        congrats_msg = f"🏅 **ماشالا! ۶۰ روز آپتایم برای سرور `{s_info['name']}`!**\nاین سرور مثل یه خفاش واقعی خستگی‌ناپذیره! 😎🦇"
+                    elif uptime_days >= 90:
+                        congrats_msg = f"👑 **رکورد عالی! سرور `{s_info['name']}` بیش از {uptime_days} روزه که خاموش نشده!**\nیه سرور باثبات و قدرتمند. دمت گرم! 🚀🦇"
+                    
+                    if congrats_msg:
+                        try: await context.bot.send_message(uid, congrats_msg, parse_mode='Markdown')
+                        except: pass
+            # -------------------------------------------------
+
             alert_msgs = []
             if r['cpu'] >= settings['cpu']: alert_msgs.append(f"🧠 **CPU:** `{r['cpu']}%`")
             if r['ram'] >= settings['ram']: alert_msgs.append(f"💾 **RAM:** `{r['ram']}%`")
