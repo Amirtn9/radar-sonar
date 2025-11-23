@@ -38,8 +38,8 @@ from telegram.ext import (
 # ==============================================================================
 # ⚙️ CONFIGURATION & CONSTANTS
 # ==============================================================================
-TOKEN = 'tokentelegram'  # ⚠️ TOKEN
-SUPER_ADMIN_ID = 0912000000                               # ⚠️ ADMIN ID
+TOKEN = '8089255042:AAHHqh1zJFHbj6_c5QUTPv_6thKHgNCg2NI'  # ⚠️ TOKEN
+SUPER_ADMIN_ID = 585214295                               # ⚠️ ADMIN ID
 DEFAULT_INTERVAL = 60
 DOWN_RETRY_LIMIT = 3
 DB_NAME = 'sonar_ultra_pro.db'
@@ -56,7 +56,7 @@ DAILY_REPORT_USAGE = {}
     GET_NAME, GET_IP, GET_PORT, GET_USER, GET_PASS, SELECT_GROUP,
     GET_GROUP_NAME, GET_CHANNEL_FORWARD, GET_MANUAL_HOST,
     ADD_ADMIN_ID, ADD_ADMIN_DAYS, ADMIN_SEARCH_USER,
-    ADMIN_SET_LIMIT, ADMIN_RESTORE_DB, ADMIN_SET_TIME_MANUAL,
+    ADMIN_SET_LIMIT, ADMIN_RESTORE_DB, ADMIN_RESTORE_KEY, ADMIN_SET_TIME_MANUAL,
     GET_CUSTOM_INTERVAL,
     GET_EXPIRY,
     GET_CHANNEL_TYPE,
@@ -64,7 +64,7 @@ DAILY_REPORT_USAGE = {}
     GET_REMOTE_COMMAND,  
     GET_CPU_LIMIT, GET_RAM_LIMIT, GET_DISK_LIMIT,
     GET_BROADCAST_MSG
-) = range(24)
+) = range(25)
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -464,12 +464,19 @@ class ServerMonitor:
 
     @staticmethod
     def make_bar(percentage, length=10):
+        # --- اصلاح شده برای جلوگیری از کرش ---
+        if not isinstance(percentage, (int, float)):
+            percentage = 0
+        # ------------------------------------
         blocks = "▏▎▍▌▋▊▉█"
         if percentage < 0: percentage = 0
         if percentage > 100: percentage = 100
         full_blocks = int((percentage / 100) * length)
         remainder = (percentage / 100) * length - full_blocks
         idx = int(remainder * len(blocks))
+        
+        if idx >= len(blocks): idx = len(blocks) - 1
+        
         bar = "█" * full_blocks
         if full_blocks < length: bar += blocks[idx] + " " * (length - full_blocks - 1)
         return bar
@@ -723,9 +730,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     full_name = update.effective_user.full_name
     context.user_data.clear()
-    db.add_or_update_user(user_id, full_name=full_name, days=180)
-    has_access, msg = db.check_access(user_id)
-
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, db.add_or_update_user, user_id, full_name, 180)
+    has_access, msg = await loop.run_in_executor(None, db.check_access, user_id)
+    
     if not has_access:
         await update.effective_message.reply_text(f"⛔️ **دسترسی مسدود است**\nعلت: {msg}", parse_mode='Markdown')
         return
@@ -832,6 +840,8 @@ async def admin_panel_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📢 ارسال پیام همگانی", callback_data='admin_broadcast_start')],
         [InlineKeyboardButton("🔎 جستجوی کاربر", callback_data='admin_search_start'), InlineKeyboardButton("📄 لیست متنی", callback_data='admin_users_text')],
         [InlineKeyboardButton("📥 دریافت بکاپ", callback_data='admin_backup_get'), InlineKeyboardButton("📤 بازنشانی بکاپ", callback_data='admin_backup_restore_start')],
+        [InlineKeyboardButton("🔑 دریافت کلید (Backup Key)", callback_data='admin_key_backup_get'), InlineKeyboardButton("🗝 بازیابی کلید (Restore Key)", callback_data='admin_key_restore_start')
+        ],
         [InlineKeyboardButton("🔙 بازگشت", callback_data='main_menu')]
     ]
     
@@ -1070,7 +1080,31 @@ async def admin_backup_restore_handler(update: Update, context: ContextTypes.DEF
         await update.message.reply_text(f"❌ خطا در بازنشانی: {e}")
     
     return ConversationHandler.END
+# --- SECRET KEY HANDLERS ---
 
+# --- SECRET KEY HANDLERS ---
+async def admin_key_backup_get(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not os.path.exists(KEY_FILE):
+        await update.callback_query.answer("❌ فایل کلید یافت نشد!", show_alert=True)
+        return
+    await update.callback_query.message.reply_document(
+        document=open(KEY_FILE, 'rb'), 
+        caption="🔑 **فایل کلید امنیتی (Secret Key)**\n⚠️ این فایل را برای روز مبادا نگه دارید."
+    )
+
+async def admin_key_restore_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_edit_message(update, "🗝 **لطفاً فایل secret.key را ارسال کنید:**", reply_markup=get_cancel_markup())
+    return ADMIN_RESTORE_KEY
+
+async def admin_key_restore_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    f = await update.message.document.get_file()
+    await f.download_to_drive("temp_key.key")
+    if os.path.exists(KEY_FILE): os.remove(KEY_FILE)
+    os.rename("temp_key.key", KEY_FILE)
+    global sec; sec = Security() # Reload Key
+    await update.message.reply_text("✅ **کلید امنیتی بازیابی شد!**")
+    await start(update, context)
+    return ConversationHandler.END
 # --- Add New User Handlers ---
 async def add_new_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
@@ -2105,27 +2139,37 @@ async def check_expiry_job(context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Expiry Check Error: {e}")
 
 async def global_monitor_job(context: ContextTypes.DEFAULT_TYPE):
-    all_users = set([u['user_id'] for u in db.get_all_users()] + [SUPER_ADMIN_ID])
+    # --- اصلاح شده: اجرای سبک‌تر و جلوگیری از هنگ کردن ---
     loop = asyncio.get_running_loop()
-    all_tasks = []
+    users_list = await loop.run_in_executor(None, db.get_all_users)
+    all_users = set([u['user_id'] for u in users_list] + [SUPER_ADMIN_ID])
     
+    # محدودیت: فقط ۱۰ سرور همزمان چک شوند
+    semaphore = asyncio.Semaphore(10) 
+
+    async def protected_process(uid):
+        async with semaphore:
+            servers = await loop.run_in_executor(None, db.get_all_user_servers, uid)
+            if not servers: return
+
+            def get_user_settings():
+                return {
+                    'report_interval': db.get_setting(uid, 'report_interval'),
+                    'cpu': int(db.get_setting(uid, 'cpu_threshold') or 80),
+                    'ram': int(db.get_setting(uid, 'ram_threshold') or 80),
+                    'disk': int(db.get_setting(uid, 'disk_threshold') or 90),
+                    'down_alert': db.get_setting(uid, 'down_alert_enabled') == '1'
+                }
+            settings = await loop.run_in_executor(None, get_user_settings)
+            
+            await process_single_user(context, uid, servers, settings, loop)
+
+    all_tasks = []
     for uid in all_users:
-        access, _ = db.check_access(uid)
-        if not access: continue
-        
-        servers = db.get_all_user_servers(uid)
-        if not servers: continue
+        all_tasks.append(protected_process(uid))
 
-        settings = {
-            'report_interval': db.get_setting(uid, 'report_interval'),
-            'cpu': int(db.get_setting(uid, 'cpu_threshold') or 80),
-            'ram': int(db.get_setting(uid, 'ram_threshold') or 80),
-            'disk': int(db.get_setting(uid, 'disk_threshold') or 90),
-            'down_alert': db.get_setting(uid, 'down_alert_enabled') == '1'
-        }
-        all_tasks.append(process_single_user(context, uid, servers, settings, loop))
-
-    await asyncio.gather(*all_tasks)
+    if all_tasks:
+        await asyncio.gather(*all_tasks)
 
 async def process_single_user(context, uid, servers, settings, loop):
     tasks = []
@@ -2229,6 +2273,7 @@ def main():
 
     text_filter = filters.TEXT & ~filters.COMMAND
 
+    # هندلر اصلی (مکالمات عادی و ادمین)
     conv_handler = ConversationHandler(
         allow_reentry=True, 
         entry_points=[
@@ -2289,9 +2334,22 @@ def main():
             CommandHandler('start', start)
         ]
     )
-
     app.add_handler(conv_handler)
 
+    # هندلر مدیریت کلید امنیتی (Backup/Restore Key)
+    key_conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_key_restore_start, pattern='^admin_key_restore_start$')],
+        states={
+            ADMIN_RESTORE_KEY: [MessageHandler(filters.Document.ALL, admin_key_restore_handler)]
+        },
+        fallbacks=[CallbackQueryHandler(cancel_handler_func, pattern='^cancel_flow$')]
+    )
+    app.add_handler(key_conv_handler)
+    
+    # هندلر دریافت بکاپ کلید (بدون State)
+    app.add_handler(CallbackQueryHandler(admin_key_backup_get, pattern='^admin_key_backup_get$'))
+
+    # سایر هندلرها
     app.add_handler(CommandHandler('start', start))
     app.add_handler(CommandHandler('dashboard', dashboard_command))
     app.add_handler(CommandHandler('setting', settings_command))
