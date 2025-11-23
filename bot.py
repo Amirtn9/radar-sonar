@@ -116,6 +116,11 @@ class Security:
 class Database:
     def __init__(self):
         self.lock = threading.Lock()
+        # Fix 8: اگر self.conn از قبل وجود داشته باشد و باز باشد، آن را ببندیم.
+        # این برای اطمینان از تمیز بودن اتصال در زمان re-init (مانند restore backup) حیاتی است.
+        if hasattr(self, 'conn') and self.conn:
+             self.conn.close() 
+
         self.conn = sqlite3.connect(DB_NAME, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         try: # Fix 1: اضافه کردن Try/Except برای اجرای PRAGMA تا در صورت خراب بودن دیتابیس (Malformed DB) کرش نکند.
@@ -725,7 +730,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not has_access:
         # Fix 7: استفاده از effective_message برای ارسال پیام دسترسی مسدود، تا هم برای دستورات (Command) و هم برای Callback Query ها کار کند.
-        await update.effective_message.reply_text(f"⛔️ **دسترسی مسدود است**\nعلت: {msg}", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⛔️ **دسترسی مسدود است**\nعلت: {msg}", parse_mode='Markdown') 
         return
     
     remaining = f"{msg} روز" if isinstance(msg, int) else "♾ نامحدود"
@@ -1760,7 +1765,8 @@ async def manage_servers_list(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.callback_query.answer()
     servers = db.get_all_user_servers(update.effective_user.id)
     kb = [[InlineKeyboardButton(f"{'🟢' if s['is_active'] else '🔴'} | {s['name']}", callback_data=f'toggle_active_{s["id"]}')] for s in servers]
-    kb.append([InlineKeyboardButton("🔙 بازگشت", callback_data='status_dashboard')])
+    kb.append([InlineKeyboardButton("🔙 بازگشت", callback_data='status_dashboard')]
+    )
     await safe_edit_message(update, "🛠 **مدیریت مانیتورینگ:**\nبا کلیک روی هر سرور، مانیتورینگ آن را روشن/خاموش کنید.", reply_markup=InlineKeyboardMarkup(kb))
 
 async def toggle_server_active_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1769,302 +1775,6 @@ async def toggle_server_active_action(update: Update, context: ContextTypes.DEFA
     db.toggle_server_active(sid, srv['is_active'])
     await update.callback_query.answer(f"وضعیت {srv['name']} تغییر کرد.")
     await manage_servers_list(update, context)
-
-
-# ==============================================================================
-# 📅 EXPIRY & TERMINAL HANDLERS
-# ==============================================================================
-async def edit_expiry_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    sid = query.data.split('_')[2]
-    context.user_data['edit_expiry_sid'] = sid
-    srv = db.get_server_by_id(sid)
-    txt = (
-        f"📅 **تغییر زمان انقضای سرور: {srv['name']}**\n\n"
-        f"🔢 لطفاً **تعداد روزهای باقی‌مانده** را به عدد وارد کنید.\n"
-        f"مثلاً اگر عدد `30` را بفرستید، انقضا روی ۳۰ روز دیگر تنظیم می‌شود.\n\n"
-        f"♾ برای **نامحدود** کردن، عدد `0` را بفرستید."
-    )
-    await safe_edit_message(update, txt, reply_markup=get_cancel_markup())
-    return EDIT_SERVER_EXPIRY
-
-async def edit_expiry_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        days = int(update.message.text)
-        sid = context.user_data.get('edit_expiry_sid')
-        if days > 0:
-            new_date = (datetime.now() + timedelta(days=days)).strftime('%Y-%m-%d')
-            msg = f"✅ تاریخ انقضا با موفقیت روی **{days} روز دیگر** تنظیم شد."
-        else:
-            new_date = None
-            msg = "✅ سرور با موفقیت **نامحدود (Lifetime)** شد."
-        db.update_server_expiry(sid, new_date)
-        await update.message.reply_text(msg)
-        await server_detail(update, context, custom_sid=sid)
-        return ConversationHandler.END
-    except ValueError:
-        await update.message.reply_text("❌ لطفاً فقط عدد انگلیسی وارد کنید.")
-        return EDIT_SERVER_EXPIRY
-
-async def ask_terminal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    sid = query.data.split('_')[2]
-    srv = db.get_server_by_id(sid)
-    context.user_data['term_sid'] = sid 
-    
-    kb = [[InlineKeyboardButton("🔙 خروج و بازگشت به پنل", callback_data='exit_terminal')]]
-    
-    txt = (
-        f"📟 **ترمینال تعاملی: {srv['name']}**\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n"
-        f"🟢 **اتصال برقرار شد.**\n"
-        f"هر دستوری بنویسی اجرا میشه. برای خروج دکمه پایین رو بزن.\n\n"
-        f"root@{srv['ip']}:~# _"
-    )
-    
-    await query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
-    return GET_REMOTE_COMMAND
-
-async def run_terminal_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cmd = update.message.text
-    if cmd.lower() in ['exit', 'quit']:
-        return await close_terminal_session(update, context)
-
-    sid = context.user_data.get('term_sid')
-    srv = db.get_server_by_id(sid)
-    
-    wait_msg = await update.message.reply_text(f"⚙️ `{cmd}` ...")
-    
-    real_pass = sec.decrypt(srv['password'])
-    ok, output = await asyncio.get_running_loop().run_in_executor(None, ServerMonitor.run_remote_command, srv['ip'], srv['port'], srv['username'], real_pass, cmd)
-    
-    if not output: output = "[No Output]"
-    if len(output) > 3000: output = output[:3000] + "\n..."
-    safe_output = html.escape(output)
-    status = "✅" if ok else "❌"
-    
-    terminal_view = (
-        f"<code>root@{srv['ip']}:~# {cmd}</code>\n"
-        f"{status}\n"
-        f"<pre language='bash'>{safe_output}</pre>"
-    )
-    
-    kb = [[InlineKeyboardButton("🔙 خروج از ترمینال", callback_data='exit_terminal')]]
-    await wait_msg.delete()
-    try:
-        await update.message.reply_text(terminal_view, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(kb))
-    except:
-        await update.message.reply_text(f"⚠️ Raw Output:\n{output}", reply_markup=InlineKeyboardMarkup(kb))
-    
-    return GET_REMOTE_COMMAND
-
-async def close_terminal_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query: await update.callback_query.answer()
-    sid = context.user_data.get('term_sid')
-    await server_detail(update, context, custom_sid=sid)
-    return ConversationHandler.END
-
-async def manual_ping_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(update, "🔎 **IP/Domain:**", reply_markup=get_cancel_markup())
-    return GET_MANUAL_HOST
-
-async def perform_manual_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("🌍 Check-Host...")
-    ok, data = await asyncio.get_running_loop().run_in_executor(None, ServerMonitor.check_host_api, update.message.text)
-    report = ServerMonitor.format_check_host_results(data) if ok else f"❌ {data}"
-    await context.bot.send_message(chat_id=msg.chat_id, text=report, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data='main_menu')]]))
-    return ConversationHandler.END
-
-
-# ==============================================================================
-# ⚙️ SETTINGS & CONFIG HANDLERS
-# ==============================================================================
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await settings_menu(update, context)
-
-async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if update.callback_query: await update.callback_query.answer()
-    
-    down_alert = db.get_setting(uid, 'down_alert_enabled') or '1'
-    alert_icon = "🔔 روشن" if down_alert == '1' else "🔕 خاموش"
-    
-    kb = [
-        [InlineKeyboardButton("📢 مدیریت کانال‌های هشدار", callback_data='channels_menu')],
-        [InlineKeyboardButton("⏰ بازه گزارش خودکار", callback_data='settings_cron')],
-        [InlineKeyboardButton("🎚 تنظیم آستانه هشدار (Resource)", callback_data='settings_thresholds')],
-        [InlineKeyboardButton(f"🚨 هشدار قطعی سرور: {alert_icon}", callback_data=f'toggle_downalert_{"0" if down_alert=="1" else "1"}')],
-        [
-            InlineKeyboardButton("🔄 آپدیت خودکار (Dev)", callback_data='dev_feature'),
-            InlineKeyboardButton("⚠️ ریبوت خودکار (Dev)", callback_data='dev_feature')
-        ],
-        [
-            InlineKeyboardButton("📡 دریافت اطلاعات فوری (ارسال به کانال)", callback_data='act_global_full_report')
-        ],
-        [InlineKeyboardButton("🇬🇧 زبان (Language)", callback_data='dev_feature')],
-        [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data='main_menu')]
-    ]
-    
-    txt = (
-        "⚙️ **مرکز تنظیمات ربات**\n\n"
-        "در اینجا می‌توانید رفتار ربات، زمان‌بندی گزارش‌ها و حساسیت هشدارها را کنترل کنید."
-    )
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
-
-async def toggle_down_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db.set_setting(update.effective_user.id, 'down_alert_enabled', update.callback_query.data.split('_')[2])
-    await settings_menu(update, context)
-
-async def resource_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if update.callback_query: await update.callback_query.answer()
-    
-    cpu_limit = db.get_setting(uid, 'cpu_threshold') or '80'
-    ram_limit = db.get_setting(uid, 'ram_threshold') or '80'
-    disk_limit = db.get_setting(uid, 'disk_threshold') or '90'
-    
-    kb = [
-        [InlineKeyboardButton(f"🧠 هشدار CPU (فعلی: {cpu_limit}%)", callback_data='set_cpu_limit')],
-        [InlineKeyboardButton(f"💾 هشدار RAM (فعلی: {ram_limit}%)", callback_data='set_ram_limit')],
-        [InlineKeyboardButton(f"💿 هشدار Disk (فعلی: {disk_limit}%)", callback_data='set_disk_limit')],
-        [InlineKeyboardButton("🔙 بازگشت به تنظیمات", callback_data='settings_menu')]
-    ]
-    txt = "🎚 **تنظیم آستانه حساسیت:**\nاگر مصرف منابع از این مقادیر رد شود، هشدار دریافت می‌کنید."
-    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
-
-async def ask_cpu_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(update, "🧠 **حداکثر درصد مجاز CPU (0-100):**", reply_markup=get_cancel_markup())
-    return GET_CPU_LIMIT
-
-async def save_cpu_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        val = int(update.message.text)
-        if 1 <= val <= 100:
-            db.set_setting(update.effective_user.id, 'cpu_threshold', val)
-            await update.message.reply_text(f"✅ ذخیره شد: {val}%")
-            await resource_settings_menu(update, context)
-            return ConversationHandler.END
-    except: pass
-    await update.message.reply_text("❌ عدد نامعتبر.")
-    return GET_CPU_LIMIT
-
-async def ask_ram_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(update, "💾 **حداکثر درصد مجاز RAM (0-100):**", reply_markup=get_cancel_markup())
-    return GET_RAM_LIMIT
-
-async def save_ram_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        val = int(update.message.text)
-        if 1 <= val <= 100:
-            db.set_setting(update.effective_user.id, 'ram_threshold', val)
-            await update.message.reply_text(f"✅ ذخیره شد: {val}%")
-            await resource_settings_menu(update, context)
-            return ConversationHandler.END
-    except: pass
-    await update.message.reply_text("❌ عدد نامعتبر.")
-    return GET_RAM_LIMIT
-
-async def ask_disk_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(update, "💿 **حداکثر درصد مجاز Disk (0-100):**", reply_markup=get_cancel_markup())
-    return GET_DISK_LIMIT
-
-async def save_disk_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        val = int(update.message.text)
-        if 1 <= val <= 100:
-            db.set_setting(update.effective_user.id, 'disk_threshold', val)
-            await update.message.reply_text(f"✅ ذخیره شد: {val}%")
-            await resource_settings_menu(update, context)
-            return ConversationHandler.END
-    except: pass
-    await update.message.reply_text("❌ عدد نامعتبر.")
-    return GET_DISK_LIMIT
-
-async def settings_cron_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    current_val = db.get_setting(uid, 'report_interval') or '0'
-    def get_label(text, value): return f"✅ {text}" if str(value) == str(current_val) else text
-    kb = [
-        [InlineKeyboardButton(get_label("30m", 1800), callback_data='setcron_1800'), InlineKeyboardButton(get_label("60m", 3600), callback_data='setcron_3600')],
-        [InlineKeyboardButton(get_label("12h", 43200), callback_data='setcron_43200'), InlineKeyboardButton(get_label("❌ Off", 0), callback_data='setcron_0')],
-        [InlineKeyboardButton("✍️ زمان دلخواه", callback_data='setcron_custom'), InlineKeyboardButton("🔙 بازگشت", callback_data='settings_menu')]
-    ]
-    await safe_edit_message(update, "⏰ **بازه گزارش خودکار:**", reply_markup=InlineKeyboardMarkup(kb))
-
-async def set_cron_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db.set_setting(update.effective_user.id, 'report_interval', int(update.callback_query.data.split('_')[1]))
-    await update.callback_query.answer("ذخیره شد.")
-    await settings_cron_menu(update, context)
-
-async def ask_custom_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(update, "✍️ **بازه زمانی (دقیقه) را وارد کنید:**", reply_markup=get_cancel_markup())
-    return GET_CUSTOM_INTERVAL
-
-async def set_custom_interval_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        minutes = int(update.message.text)
-        if 10 <= minutes <= 1440:
-            db.set_setting(update.effective_user.id, 'report_interval', minutes * 60)
-            await update.message.reply_text(f"✅ تنظیم شد: هر {minutes} دقیقه.")
-            await settings_cron_menu(update, context)
-            return ConversationHandler.END
-    except: pass
-    await update.message.reply_text("❌ عدد نامعتبر (بین 10 تا 1440).")
-    return GET_CUSTOM_INTERVAL
-
-async def channels_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    chans = db.get_user_channels(uid)
-    
-    type_map = {
-        'all': '✅ همه', 
-        'down': '🚨 قطعی', 
-        'report': '📊 گزارش', 
-        'expiry': '⏳ انقضا',
-        'resource': '🔥 منابع' 
-    }
-    
-    kb = [[InlineKeyboardButton(f"🗑 {c['name']} ({type_map.get(c['usage_type'],'all')})", callback_data=f'delchan_{c["id"]}')] for c in chans]
-    kb.append([InlineKeyboardButton("➕ افزودن کانال", callback_data='add_channel')])
-    kb.append([InlineKeyboardButton("🔙 بازگشت به تنظیمات", callback_data='settings_menu')])
-    await safe_edit_message(update, "📢 **مدیریت کانال‌ها:**", reply_markup=InlineKeyboardMarkup(kb))
-
-async def add_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_edit_message(update, "📝 یک پیام از کانال مورد نظر **فوروارد** کنید:", reply_markup=get_cancel_markup())
-    return GET_CHANNEL_FORWARD
-
-async def get_channel_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.forward_from_chat and update.message.forward_from_chat.type == 'channel':
-        context.user_data['new_chan'] = {'id': str(update.message.forward_from_chat.id), 'name': update.message.forward_from_chat.title}
-        
-        kb = [
-            [InlineKeyboardButton("🔥 فقط فشار منابع (CPU/RAM)", callback_data='type_resource')],
-            
-            [InlineKeyboardButton("🚨 فقط هشدار قطعی", callback_data='type_down'), InlineKeyboardButton("⏳ فقط انقضا", callback_data='type_expiry')],
-            [InlineKeyboardButton("📊 فقط گزارشات", callback_data='type_report'), InlineKeyboardButton("✅ همه موارد", callback_data='type_all')]
-        ]
-        await update.message.reply_text("🛠 **این کانال برای دریافت چه نوع پیام‌هایی استفاده شود؟**", reply_markup=InlineKeyboardMarkup(kb))
-        return GET_CHANNEL_TYPE
-    
-    await update.message.reply_text("❌ لطفاً یک پیام از کانال **فوروارد** کنید.")
-    return GET_CHANNEL_FORWARD
-
-async def set_channel_type_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    usage = query.data.split('_')[1]
-    cdata = context.user_data['new_chan']
-    db.add_channel(update.effective_user.id, cdata['id'], cdata['name'], usage)
-    await query.message.reply_text(f"✅ کانال {cdata['name']} ثبت شد.")
-    await channels_menu(update, context)
-    return ConversationHandler.END
-
-async def delete_channel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db.delete_channel(int(update.callback_query.data.split('_')[1]), update.effective_user.id)
-    await channels_menu(update, context)
 
 
 # ==============================================================================
