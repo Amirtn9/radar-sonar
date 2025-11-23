@@ -22,14 +22,14 @@ NC='\033[0m' # No Color
 function show_header() {
     clear
     echo -e "${CYAN}"
-    echo "   _____  ____  _   _          _____ "
-    echo "  / ____|/ __ \| \ | |   /\   |  __ \\"
-    echo " | (___ | |  | |  \| |  /  \  | |__) |"
-    echo "  \___ \| |  | | . ' | / /\ \ |  _  / "
-    echo "  ____) | |__| | |\  |/ ____ \| | \ \ "
-    echo " |_____/ \____/|_| \_/_/    \_\_|  \_\\"
-    echo "                                      "
-    echo "      🚀 RADAR ULTRA PRO MANAGER      "
+    echo "     _____  ____  _    _           _____ "
+    echo "    / ____|/ __ \| \ | |    /\    |  __ \\"
+    echo "   | (___ | |  | |  \| |   /  \   | |__) |"
+    echo "    \___ \| |  | | . ' |  / /\ \  |  _  / "
+    echo "    ____) | |__| | |\  | / ____ \ | | \ \ "
+    echo "   |_____/ \____/|_| \_/_/    \_\_|  \_\\"
+    echo "                                          "
+    echo "       🚀 RADAR ULTRA PRO MANAGER       "
     echo -e "${NC}"
     echo -e "${BLUE}==========================================${NC}"
     sleep 0.5
@@ -62,27 +62,44 @@ function install_bot() {
 
     {
         echo 10; echo "XXX\nUpdating system packages...\nXXX"; apt-get update -y > /dev/null 2>&1
-        echo 30; echo "XXX\nInstalling Python, Git & Pip...\nXXX"; apt-get install -y python3 python3-pip python3-venv git curl > /dev/null 2>&1
+        
+        # --- FIX: Installing System Level Dependencies for Cryptography & SSH ---
+        echo 30; echo "XXX\nInstalling Core Dependencies...\nXXX" 
+        apt-get install -y python3 python3-pip python3-venv git curl build-essential libssl-dev libffi-dev python3-dev > /dev/null 2>&1
         
         echo 50; echo "XXX\nPreparing directory...\nXXX"
         if [ -f "$INSTALL_DIR/sonar_ultra_pro.db" ]; then cp "$INSTALL_DIR/sonar_ultra_pro.db" /tmp/sonar_backup.db; fi
+        if [ -f "$INSTALL_DIR/secret.key" ]; then cp "$INSTALL_DIR/secret.key" /tmp/sonar_secret.key; fi
+        
         rm -rf "$INSTALL_DIR"; mkdir -p "$INSTALL_DIR"
         
         echo 60; echo "XXX\nDownloading source code...\nXXX"
         if ! git clone "$REPO_URL" "$INSTALL_DIR" > /dev/null 2>&1; then
+            # Fallback if git fails
             curl -s -o "$INSTALL_DIR/bot.py" "$RAW_URL/bot.py"
             curl -s -o "$INSTALL_DIR/requirements.txt" "$RAW_URL/requirements.txt"
         fi
 
+        # Restore Backup
         if [ -f "/tmp/sonar_backup.db" ]; then mv /tmp/sonar_backup.db "$INSTALL_DIR/sonar_ultra_pro.db"; fi
+        if [ -f "/tmp/sonar_secret.key" ]; then mv /tmp/sonar_secret.key "$INSTALL_DIR/secret.key"; fi
 
-        echo 80; echo "XXX\nCreating Virtual Environment...\nXXX"
+        echo 75; echo "XXX\nCreating Virtual Environment...\nXXX"
         python3 -m venv "$INSTALL_DIR/venv"
         source "$INSTALL_DIR/venv/bin/activate"
-        pip install --upgrade pip > /dev/null 2>&1
+        
+        # --- FIX: Ensuring ALL Libraries are installed correctly ---
+        echo 85; echo "XXX\nUpgrading PIP & Setup Tools...\nXXX"
+        pip install --upgrade pip setuptools wheel > /dev/null 2>&1
         
         echo 90; echo "XXX\nInstalling Python Libraries...\nXXX"
-        pip install -r "$INSTALL_DIR/requirements.txt" > /dev/null 2>&1
+        # Explicitly install required libraries to avoid issues if requirements.txt is missing
+        pip install "python-telegram-bot[job-queue]" paramiko cryptography jdatetime matplotlib requests > /dev/null 2>&1
+        
+        # Also try requirements.txt if it exists
+        if [ -f "$INSTALL_DIR/requirements.txt" ]; then
+            pip install -r "$INSTALL_DIR/requirements.txt" > /dev/null 2>&1
+        fi
         
         echo 100
     } | whiptail --title "Installation" --gauge "Installing Sonar Radar..." 8 60 0
@@ -112,7 +129,7 @@ EOF
     systemctl enable $SERVICE_NAME > /dev/null 2>&1
     systemctl restart $SERVICE_NAME
 
-    whiptail --msgbox "✅ Installation Complete!\n\n🤖 Bot is now running." 8 45
+    whiptail --msgbox "✅ Installation Complete!\n\n🤖 Bot is now running.\n📦 All libraries installed." 8 45
 }
 
 # 2. Update Only (Fast Update)
@@ -140,7 +157,8 @@ function update_bot() {
         echo 60; echo "XXX\nUpdating dependencies...\nXXX"
         if [ -d "venv" ]; then
             source "venv/bin/activate"
-            pip install -r requirements.txt > /dev/null 2>&1
+            # Explicit update of libs
+            pip install --upgrade "python-telegram-bot[job-queue]" paramiko cryptography jdatetime matplotlib requests > /dev/null 2>&1
         fi
         
         echo 90; echo "XXX\nRestarting Service...\nXXX"
@@ -209,10 +227,10 @@ function check_status() {
 while true; do
     show_header
     
-    # MENU DEFINITION - CHECK THIS PART CAREFULLY
+    # MENU DEFINITION
     OPTION=$(whiptail --title "🚀 Sonar Radar Manager" --menu "Select an option:" 20 70 11 \
-    "1" "📥 Install / Re-install (Reset DB if needed)" \
-    "2" "🔄 Update Source Code (Keep DB)" \
+    "1" "📥 Install / Re-install (Fix Dependencies)" \
+    "2" "🔄 Update Source Code" \
     "3" "⚙️ Configure Token & Admin ID" \
     "4" "⏯️ Restart Bot" \
     "5" "🛑 Stop Bot" \
