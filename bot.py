@@ -1985,17 +1985,52 @@ async def add_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return GET_CHANNEL_FORWARD
 
 async def get_channel_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.forward_from_chat and update.message.forward_from_chat.type == 'channel':
-        context.user_data['new_chan'] = {'id': str(update.message.forward_from_chat.id), 'name': update.message.forward_from_chat.title}
+    try:
+        c_id = None
+        c_name = "Channel (Manual)"
+
+        # روش ۱: تشخیص از طریق فوروارد
+        if update.message.forward_from_chat and update.message.forward_from_chat.type == 'channel':
+            c_id = str(update.message.forward_from_chat.id)
+            c_name = update.message.forward_from_chat.title
+        
+        # روش ۲: تشخیص از طریق متن (آیدی عددی یا یوزرنیم)
+        elif update.message.text:
+            text = update.message.text.strip()
+            if text.startswith('-100') or text.startswith('@'):
+                c_id = text
+                # تلاش برای گرفتن اسم کانال
+                try:
+                    chat = await context.bot.get_chat(c_id)
+                    c_name = chat.title
+                    c_id = str(chat.id) # تبدیل یوزرنیم به آیدی عددی
+                except Exception as e:
+                    # اگر ربات ادمین نباشد اسم را نمی‌تواند بگیرد، اما آیدی را قبول می‌کنیم
+                    pass
+        
+        if not c_id:
+            await update.message.reply_text(
+                "❌ **کانال شناسایی نشد!**\n\n"
+                "1️⃣ مطمئن شوید ربات در کانال **ادمین** است.\n"
+                "2️⃣ یک پیام از کانال **فوروارد** کنید.\n"
+                "3️⃣ یا **آیدی عددی** کانال را دستی بفرستید (مثال: `-100123456789`)"
+            )
+            return GET_CHANNEL_FORWARD
+
+        context.user_data['new_chan'] = {'id': c_id, 'name': c_name}
+        
         kb = [
             [InlineKeyboardButton("🔥 فقط فشار منابع (CPU/RAM)", callback_data='type_resource')],
             [InlineKeyboardButton("🚨 فقط هشدار قطعی", callback_data='type_down'), InlineKeyboardButton("⏳ فقط انقضا", callback_data='type_expiry')],
             [InlineKeyboardButton("📊 فقط گزارشات", callback_data='type_report'), InlineKeyboardButton("✅ همه موارد", callback_data='type_all')]
         ]
-        await update.message.reply_text("🛠 **این کانال برای دریافت چه نوع پیام‌هایی استفاده شود؟**", reply_markup=InlineKeyboardMarkup(kb))
+        await update.message.reply_text(f"✅ کانال **{c_name}** شناسایی شد.\n🆔 آیدی: `{c_id}`\n\n🛠 **این کانال برای دریافت چه نوع پیام‌هایی استفاده شود؟**", reply_markup=InlineKeyboardMarkup(kb))
         return GET_CHANNEL_TYPE
-    await update.message.reply_text("❌ لطفاً یک پیام از کانال **فوروارد** کنید.")
-    return GET_CHANNEL_FORWARD
+
+    except Exception as e:
+        logger.error(f"Channel Add Error: {e}")
+        await update.message.reply_text(f"❌ خطای غیرمنتظره: {e}\nلطفاً آیدی عددی کانال را دستی ارسال کنید.")
+        return GET_CHANNEL_FORWARD
 
 async def set_channel_type_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2315,7 +2350,7 @@ def main():
             GET_EXPIRY: [MessageHandler(text_filter, get_srv_expiry)],
             SELECT_GROUP: [CallbackQueryHandler(select_group)],
             GET_MANUAL_HOST: [MessageHandler(text_filter, perform_manual_ping)],
-            GET_CHANNEL_FORWARD: [MessageHandler(filters.FORWARDED, get_channel_forward)],
+            GET_CHANNEL_FORWARD: [MessageHandler(filters.ALL & ~filters.COMMAND, get_channel_forward)],
             GET_CUSTOM_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_custom_interval_action)],
             GET_CHANNEL_TYPE: [CallbackQueryHandler(set_channel_type_action, pattern='^type_')],
             EDIT_SERVER_EXPIRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_expiry_save)],
