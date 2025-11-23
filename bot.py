@@ -10,6 +10,7 @@ import io
 import html
 import datetime as dt
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 # --- Standard Time & Date Libraries ---
 from datetime import datetime, timedelta, timezone
@@ -28,7 +29,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 # --- Telegram Libraries ---
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, TelegramError, Conflict, NetworkError
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ConversationHandler, JobQueue
@@ -68,7 +69,7 @@ DAILY_REPORT_USAGE = {}
 # --- Logging Setup ---
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s', 
-    level=logging.ERROR
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore")
@@ -91,7 +92,7 @@ def get_jalali_str():
 
 
 # ==============================================================================
-# 🔐 SECURITY & DATABASE
+# 🔐 SECURITY & DATABASE (Optimized for Thread Safety)
 # ==============================================================================
 class Security:
     def __init__(self):
@@ -108,30 +109,31 @@ class Security:
     def decrypt(self, txt):
         try:
             return self.cipher.decrypt(txt.encode()).decode()
-        except:
-            return "" # Handle decryption errors gracefully
+        except Exception as e:
+            logger.error(f"Decryption failed: {e}")
+            return "" 
 
 
 class Database:
     def __init__(self):
-        self.db_path = DB_NAME
-        # چک کردن اولیه فایل دیتابیس
-        self.create_tables()
-        self.migrate()
+        self.db_name = DB_NAME
+        self.init_db()
 
-    def get_conn(self):
-        """ ایجاد یک اتصال جدید برای هر درخواست جهت جلوگیری از تداخل تردها """
-        conn = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
+    @contextmanager
+    def get_connection(self):
+        """ایجاد یک کانکشن امن و لحظه‌ای برای جلوگیری از خطای دیتابیس"""
+        conn = sqlite3.connect(self.db_name, check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        conn.execute('PRAGMA journal_mode=WAL;')
-        return conn
+        try:
+            conn.execute('PRAGMA journal_mode=WAL;')
+            yield conn
+        except sqlite3.Error as e:
+            logger.error(f"Database Error: {e}")
+        finally:
+            conn.close()
 
-    def close(self):
-        # در روش جدید نیازی به بستن دستی نیست چون از Context Manager استفاده می‌کنیم
-        pass
-
-    def create_tables(self):
-        with self.get_conn() as conn:
+    def init_db(self):
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY, full_name TEXT, added_date TEXT, expiry_date TEXT,
@@ -157,9 +159,10 @@ class Database:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )''')
             conn.commit()
+            self.migrate()
 
     def migrate(self):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             try: conn.execute("ALTER TABLE servers ADD COLUMN expiry_date TEXT")
             except: pass
             try: conn.execute("ALTER TABLE channels ADD COLUMN usage_type TEXT DEFAULT 'all'")
@@ -171,11 +174,9 @@ class Database:
     def toggle_user_plan(self, user_id):
         user = self.get_user(user_id)
         if not user: return 0 
-        
         new_plan = 1 if user['plan_type'] == 0 else 0
         new_limit = 50 if new_plan == 1 else 2
-        
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             conn.execute('UPDATE users SET plan_type = ?, server_limit = ? WHERE user_id = ?', (new_plan, new_limit, user_id))
             conn.commit()
         return new_plan
@@ -183,8 +184,7 @@ class Database:
     def add_or_update_user(self, user_id, full_name=None, days=None):
         exist = self.get_user(user_id)
         now_str = get_tehran_datetime().strftime('%Y-%m-%d %H:%M:%S')
-        
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             if exist:
                 if full_name:
                     conn.execute('UPDATE users SET full_name = ? WHERE user_id = ?', (full_name, user_id))
@@ -199,7 +199,7 @@ class Database:
             conn.commit()
             
     def update_user_limit(self, user_id, limit):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             conn.execute('UPDATE users SET server_limit = ? WHERE user_id = ?', (limit, user_id))
             conn.commit()
 
@@ -207,20 +207,20 @@ class Database:
         user = self.get_user(user_id)
         if not user: return 0
         new_state = 0 if user['is_banned'] else 1
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             conn.execute('UPDATE users SET is_banned = ? WHERE user_id = ?', (new_state, user_id))
             conn.commit()
         return new_state
 
     def get_user(self, user_id):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
             return cursor.fetchone()
 
     def get_all_users_paginated(self, page=1, per_page=5):
         offset = (page - 1) * per_page
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT * FROM users LIMIT ? OFFSET ?', (per_page, offset))
             users = cursor.fetchall()
@@ -229,13 +229,13 @@ class Database:
             return users, total
 
     def get_all_users(self):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT * FROM users')
             return cursor.fetchall()
 
     def remove_user(self, user_id):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             for t in ['users', 'servers', 'groups', 'channels']:
                 col = 'user_id' if t == 'users' else 'owner_id'
                 conn.execute(f'DELETE FROM {t} WHERE {col} = ?', (user_id,))
@@ -255,32 +255,32 @@ class Database:
 
     # --- Group Methods ---
     def add_group(self, owner_id, name):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             conn.execute('INSERT INTO groups (owner_id, name) VALUES (?,?)', (owner_id, name))
             conn.commit()
 
     def get_user_groups(self, owner_id):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT * FROM groups WHERE owner_id = ?', (owner_id,))
             return cursor.fetchall()
 
     def delete_group(self, group_id, owner_id):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             conn.execute('DELETE FROM groups WHERE id = ? AND owner_id = ?', (group_id, owner_id))
-            conn.execute('UPDATE servers SET group_id = NULL WHERE group_id = ?', (group_id,))
+            conn.execute('UPDATE servers SET group_id = NULL WHERE group_id = ? AND owner_id = ?', (group_id, owner_id)) 
             conn.commit()
 
     # --- Server Methods ---
     def add_server(self, owner_id, group_id, data):
+        g_id = group_id if group_id != 0 else None
         user = self.get_user(owner_id)
         current_servers = len(self.get_all_user_servers(owner_id))
         if user and owner_id != SUPER_ADMIN_ID:
             if current_servers >= user['server_limit']:
                 raise Exception("Server Limit Reached")
-        g_id = group_id if group_id != 0 else None
         
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             conn.execute(
                 'INSERT INTO servers (owner_id, group_id, name, ip, port, username, password, expiry_date) VALUES (?,?,?,?,?,?,?,?)',
                 (owner_id, g_id, data['name'], data['ip'], data['port'], data['username'], data['password'], data.get('expiry_date'))
@@ -288,56 +288,55 @@ class Database:
             conn.commit()
 
     def get_all_user_servers(self, owner_id):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT * FROM servers WHERE owner_id = ?', (owner_id,))
             return cursor.fetchall()
 
     def get_servers_by_group(self, owner_id, group_id):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             sql = 'SELECT * FROM servers WHERE owner_id = ? AND group_id IS NULL' if group_id == 0 else 'SELECT * FROM servers WHERE owner_id = ? AND group_id = ?'
             cursor.execute(sql, (owner_id,) if group_id == 0 else (owner_id, group_id))
             return cursor.fetchall()
 
     def get_server_by_id(self, s_id):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT * FROM servers WHERE id = ?', (s_id,))
             return cursor.fetchone()
 
     def delete_server(self, s_id, owner_id):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             conn.execute('DELETE FROM servers WHERE id = ? AND owner_id = ?', (s_id, owner_id))
             conn.commit()
 
     def update_status(self, s_id, status):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             conn.execute('UPDATE servers SET last_status = ? WHERE id = ?', (status, s_id))
             conn.commit()
 
     def update_server_expiry(self, s_id, new_date):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             conn.execute('UPDATE servers SET expiry_date = ? WHERE id = ?', (new_date, s_id))
             conn.commit()
     
     def toggle_server_active(self, s_id, current_state):
         new_state = 0 if current_state else 1
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             conn.execute('UPDATE servers SET is_active = ? WHERE id = ?', (new_state, s_id))
             conn.commit()
         return new_state
 
     # --- Stats & Charts ---
     def add_server_stat(self, server_id, cpu, ram):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             conn.execute('INSERT INTO server_stats (server_id, cpu, ram) VALUES (?, ?, ?)', (server_id, cpu, ram))
-            # Keep last 24h stats only
             conn.execute("DELETE FROM server_stats WHERE created_at < datetime('now', '-1 day')")
             conn.commit()
 
     def get_server_stats(self, server_id):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT cpu, ram, strftime('%H:%M', created_at, '+3 hours', '+30 minutes') as time_str 
@@ -349,28 +348,28 @@ class Database:
 
     # --- Channel & Settings Methods ---
     def add_channel(self, owner_id, chat_id, name, usage_type='all'):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             conn.execute('INSERT INTO channels (owner_id, chat_id, name, usage_type) VALUES (?,?,?,?)', (owner_id, chat_id, name, usage_type))
             conn.commit()
 
     def get_user_channels(self, owner_id):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT * FROM channels WHERE owner_id = ?', (owner_id,))
             return cursor.fetchall()
 
     def delete_channel(self, c_id, owner_id):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             conn.execute('DELETE FROM channels WHERE id = ? AND owner_id = ?', (c_id, owner_id))
             conn.commit()
 
     def set_setting(self, owner_id, key, value):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             conn.execute('REPLACE INTO settings (owner_id, key, value) VALUES (?, ?, ?)', (owner_id, key, str(value)))
             conn.commit()
 
     def get_setting(self, owner_id, key):
-        with self.get_conn() as conn:
+        with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT value FROM settings WHERE owner_id = ? AND key = ?', (owner_id, key,))
             res = cursor.fetchone()
@@ -632,15 +631,9 @@ class ServerMonitor:
 
 
 def generate_plot(server_name, stats):
-    """
-    Thread-safe plot generation using Object-Oriented Matplotlib interface.
-    Do NOT use plt.figure() or plt.plot() here!
-    """
     if not stats:
         return None
-    
     try:
-        # Create Figure object directly (Thread Safe)
         fig = Figure(figsize=(10, 5))
         ax = fig.add_subplot(111)
         
@@ -664,8 +657,6 @@ def generate_plot(server_name, stats):
             ax.set_xticklabels(times[::step], rotation=45)
         
         fig.tight_layout()
-        
-        # Save to IO buffer
         buf = io.BytesIO()
         FigureCanvasAgg(fig).print_png(buf)
         buf.seek(0)
@@ -719,6 +710,9 @@ async def cancel_handler_func(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling an update:", exc_info=context.error)
+    if isinstance(context.error, Conflict):
+        logger.critical("⚠️ Conflict detected: Another instance is running. Shutting down.")
+        os._exit(1) 
     if isinstance(update, Update) and update.effective_message:
         try:
             await update.effective_message.reply_text("❌ خطای داخلی سیستم. لطفاً دوباره تلاش کنید.")
@@ -733,7 +727,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_access, msg = db.check_access(user_id)
 
     if not has_access:
-        await update.message.reply_text(f"⛔️ **دسترسی مسدود است**\nعلت: {msg}")
+        await update.effective_message.reply_text(f"⛔️ **دسترسی مسدود است**\nعلت: {msg}", parse_mode='Markdown')
         return
     
     remaining = f"{msg} روز" if isinstance(msg, int) else "♾ نامحدود"
@@ -829,8 +823,7 @@ async def admin_panel_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != SUPER_ADMIN_ID: return
     
     users_count = len(db.get_all_users())
-    # Fix: استفاده از کانکشن امن برای دریافت تعداد سرورها
-    with db.get_conn() as conn:
+    with db.get_connection() as conn:
         total_servers = len(conn.execute('SELECT id FROM servers').fetchall())
     
     kb = [
@@ -1007,8 +1000,7 @@ async def admin_users_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Backup & Restore ---
 async def admin_backup_get(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer("در حال ارسال فایل...")
-    # استفاده از یک کانکشن برای اطمینان از همگام‌سازی WAL
-    with db.get_conn() as conn:
+    with db.get_connection() as conn:
         conn.execute("PRAGMA wal_checkpoint(FULL);")
     await update.callback_query.message.reply_document(document=open(DB_NAME, 'rb'), caption=f"📦 Backup: {get_jalali_str()}")
 
@@ -1060,20 +1052,17 @@ async def admin_backup_restore_handler(update: Update, context: ContextTypes.DEF
         await update.message.reply_text("❌ فرمت فایل باید .db باشد.")
         return ADMIN_RESTORE_DB
     
-    # دانلود فایل با نام موقت
     temp_name = "temp_restore.db"
     f = await doc.get_file()
     await f.download_to_drive(temp_name)
     
-    # جایگزینی امن
     try:
         if os.path.exists(DB_NAME):
             os.remove(DB_NAME)
         os.rename(temp_name, DB_NAME)
         
         # Re-initialize to ensure tables exist if backup was old
-        db.create_tables()
-        db.migrate()
+        db.init_db()
         
         await update.message.reply_text("✅ دیتابیس با موفقیت بازنشانی شد.")
         await start(update, context)
@@ -1798,6 +1787,288 @@ async def toggle_server_active_action(update: Update, context: ContextTypes.DEFA
     await update.callback_query.answer(f"وضعیت {srv['name']} تغییر کرد.")
     await manage_servers_list(update, context)
 
+# --- New Missing Functions Added Here ---
+
+async def manual_ping_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_edit_message(update, "🔎 **لطفاً آدرس IP یا دامنه مورد نظر را ارسال کنید:**", reply_markup=get_cancel_markup())
+    return GET_MANUAL_HOST
+
+async def perform_manual_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    host = update.message.text
+    msg = await update.message.reply_text("🌍 **در حال استعلام از Check-Host...**")
+    loop = asyncio.get_running_loop()
+    ok, data = await loop.run_in_executor(None, ServerMonitor.check_host_api, host)
+    
+    report = ServerMonitor.format_check_host_results(data) if ok else f"❌ خطا: {data}"
+    await context.bot.send_message(chat_id=msg.chat_id, text=report, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 منوی اصلی", callback_data='main_menu')]]))
+    return ConversationHandler.END
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await settings_menu(update, context)
+
+async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if update.callback_query: await update.callback_query.answer()
+    
+    down_alert = db.get_setting(uid, 'down_alert_enabled') or '1'
+    alert_icon = "🔔 روشن" if down_alert == '1' else "🔕 خاموش"
+    
+    kb = [
+        [InlineKeyboardButton("📢 مدیریت کانال‌های هشدار", callback_data='channels_menu')],
+        [InlineKeyboardButton("⏰ بازه گزارش خودکار", callback_data='settings_cron')],
+        [InlineKeyboardButton("🎚 تنظیم آستانه هشدار (Resource)", callback_data='settings_thresholds')],
+        [InlineKeyboardButton(f"🚨 هشدار قطعی سرور: {alert_icon}", callback_data=f'toggle_downalert_{"0" if down_alert=="1" else "1"}')],
+        [
+            InlineKeyboardButton("🔄 آپدیت خودکار (Dev)", callback_data='dev_feature'),
+            InlineKeyboardButton("⚠️ ریبوت خودکار (Dev)", callback_data='dev_feature')
+        ],
+        [
+            InlineKeyboardButton("📡 دریافت اطلاعات فوری (ارسال به کانال)", callback_data='send_instant_report')
+        ],
+        [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data='main_menu')]
+    ]
+    
+    txt = (
+        "⚙️ **مرکز تنظیمات ربات**\n\n"
+        "در اینجا می‌توانید رفتار ربات، زمان‌بندی گزارش‌ها و حساسیت هشدارها را کنترل کنید."
+    )
+    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
+
+async def channels_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    chans = db.get_user_channels(uid)
+    
+    type_map = {'all': '✅ همه', 'down': '🚨 قطعی', 'report': '📊 گزارش', 'expiry': '⏳ انقضا', 'resource': '🔥 منابع'}
+    
+    kb = [[InlineKeyboardButton(f"🗑 {c['name']} ({type_map.get(c['usage_type'],'all')})", callback_data=f'delchan_{c["id"]}')] for c in chans]
+    kb.append([InlineKeyboardButton("➕ افزودن کانال", callback_data='add_channel')])
+    kb.append([InlineKeyboardButton("🔙 بازگشت به تنظیمات", callback_data='settings_menu')])
+    await safe_edit_message(update, "📢 **مدیریت کانال‌ها:**", reply_markup=InlineKeyboardMarkup(kb))
+
+async def settings_cron_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    current_val = db.get_setting(uid, 'report_interval') or '0'
+    def get_label(text, value): return f"✅ {text}" if str(value) == str(current_val) else text
+    kb = [
+        [InlineKeyboardButton(get_label("30m", 1800), callback_data='setcron_1800'), InlineKeyboardButton(get_label("60m", 3600), callback_data='setcron_3600')],
+        [InlineKeyboardButton(get_label("12h", 43200), callback_data='setcron_43200'), InlineKeyboardButton(get_label("❌ Off", 0), callback_data='setcron_0')],
+        [InlineKeyboardButton("✍️ زمان دلخواه", callback_data='setcron_custom'), InlineKeyboardButton("🔙 بازگشت", callback_data='settings_menu')]
+    ]
+    await safe_edit_message(update, "⏰ **بازه گزارش خودکار:**", reply_markup=InlineKeyboardMarkup(kb))
+
+async def set_cron_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db.set_setting(update.effective_user.id, 'report_interval', int(update.callback_query.data.split('_')[1]))
+    await update.callback_query.answer("ذخیره شد.")
+    await settings_cron_menu(update, context)
+
+async def resource_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if update.callback_query: await update.callback_query.answer()
+    
+    cpu_limit = db.get_setting(uid, 'cpu_threshold') or '80'
+    ram_limit = db.get_setting(uid, 'ram_threshold') or '80'
+    disk_limit = db.get_setting(uid, 'disk_threshold') or '90'
+    
+    kb = [
+        [InlineKeyboardButton(f"🧠 هشدار CPU (فعلی: {cpu_limit}%)", callback_data='set_cpu_limit')],
+        [InlineKeyboardButton(f"💾 هشدار RAM (فعلی: {ram_limit}%)", callback_data='set_ram_limit')],
+        [InlineKeyboardButton(f"💿 هشدار Disk (فعلی: {disk_limit}%)", callback_data='set_disk_limit')],
+        [InlineKeyboardButton("🔙 بازگشت به تنظیمات", callback_data='settings_menu')]
+    ]
+    txt = "🎚 **تنظیم آستانه حساسیت:**\nاگر مصرف منابع از این مقادیر رد شود، هشدار دریافت می‌کنید."
+    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
+
+async def toggle_down_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db.set_setting(update.effective_user.id, 'down_alert_enabled', update.callback_query.data.split('_')[2])
+    await settings_menu(update, context)
+
+async def ask_cpu_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_edit_message(update, "🧠 **حداکثر درصد مجاز CPU (0-100):**", reply_markup=get_cancel_markup())
+    return GET_CPU_LIMIT
+
+async def save_cpu_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = int(update.message.text)
+        if 1 <= val <= 100:
+            db.set_setting(update.effective_user.id, 'cpu_threshold', val)
+            await update.message.reply_text(f"✅ ذخیره شد: {val}%")
+            await resource_settings_menu(update, context)
+            return ConversationHandler.END
+    except: pass
+    await update.message.reply_text("❌ عدد نامعتبر.")
+    return GET_CPU_LIMIT
+
+async def ask_ram_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_edit_message(update, "💾 **حداکثر درصد مجاز RAM (0-100):**", reply_markup=get_cancel_markup())
+    return GET_RAM_LIMIT
+
+async def save_ram_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = int(update.message.text)
+        if 1 <= val <= 100:
+            db.set_setting(update.effective_user.id, 'ram_threshold', val)
+            await update.message.reply_text(f"✅ ذخیره شد: {val}%")
+            await resource_settings_menu(update, context)
+            return ConversationHandler.END
+    except: pass
+    await update.message.reply_text("❌ عدد نامعتبر.")
+    return GET_RAM_LIMIT
+
+async def ask_disk_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_edit_message(update, "💿 **حداکثر درصد مجاز Disk (0-100):**", reply_markup=get_cancel_markup())
+    return GET_DISK_LIMIT
+
+async def save_disk_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = int(update.message.text)
+        if 1 <= val <= 100:
+            db.set_setting(update.effective_user.id, 'disk_threshold', val)
+            await update.message.reply_text(f"✅ ذخیره شد: {val}%")
+            await resource_settings_menu(update, context)
+            return ConversationHandler.END
+    except: pass
+    await update.message.reply_text("❌ عدد نامعتبر.")
+    return GET_DISK_LIMIT
+
+async def ask_custom_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_edit_message(update, "✍️ **بازه زمانی (دقیقه) را وارد کنید:**", reply_markup=get_cancel_markup())
+    return GET_CUSTOM_INTERVAL
+
+async def set_custom_interval_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        minutes = int(update.message.text)
+        if 10 <= minutes <= 1440:
+            db.set_setting(update.effective_user.id, 'report_interval', minutes * 60)
+            await update.message.reply_text(f"✅ تنظیم شد: هر {minutes} دقیقه.")
+            await settings_cron_menu(update, context)
+            return ConversationHandler.END
+    except: pass
+    await update.message.reply_text("❌ عدد نامعتبر (بین 10 تا 1440).")
+    return GET_CUSTOM_INTERVAL
+
+async def add_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await safe_edit_message(update, "📝 یک پیام از کانال مورد نظر **فوروارد** کنید:", reply_markup=get_cancel_markup())
+    return GET_CHANNEL_FORWARD
+
+async def get_channel_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.forward_from_chat and update.message.forward_from_chat.type == 'channel':
+        context.user_data['new_chan'] = {'id': str(update.message.forward_from_chat.id), 'name': update.message.forward_from_chat.title}
+        kb = [
+            [InlineKeyboardButton("🔥 فقط فشار منابع (CPU/RAM)", callback_data='type_resource')],
+            [InlineKeyboardButton("🚨 فقط هشدار قطعی", callback_data='type_down'), InlineKeyboardButton("⏳ فقط انقضا", callback_data='type_expiry')],
+            [InlineKeyboardButton("📊 فقط گزارشات", callback_data='type_report'), InlineKeyboardButton("✅ همه موارد", callback_data='type_all')]
+        ]
+        await update.message.reply_text("🛠 **این کانال برای دریافت چه نوع پیام‌هایی استفاده شود؟**", reply_markup=InlineKeyboardMarkup(kb))
+        return GET_CHANNEL_TYPE
+    await update.message.reply_text("❌ لطفاً یک پیام از کانال **فوروارد** کنید.")
+    return GET_CHANNEL_FORWARD
+
+async def set_channel_type_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    usage = query.data.split('_')[1]
+    cdata = context.user_data['new_chan']
+    db.add_channel(update.effective_user.id, cdata['id'], cdata['name'], usage)
+    await query.message.reply_text(f"✅ کانال {cdata['name']} ثبت شد.")
+    await channels_menu(update, context)
+    return ConversationHandler.END
+
+async def delete_channel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db.delete_channel(int(update.callback_query.data.split('_')[1]), update.effective_user.id)
+    await channels_menu(update, context)
+
+async def edit_expiry_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    sid = query.data.split('_')[2]
+    context.user_data['edit_expiry_sid'] = sid
+    srv = db.get_server_by_id(sid)
+    txt = (
+        f"📅 **تغییر زمان انقضای سرور: {srv['name']}**\n\n"
+        f"🔢 لطفاً **تعداد روزهای باقی‌مانده** را به عدد وارد کنید.\n"
+        f"مثلاً اگر عدد `30` را بفرستید، انقضا روی ۳۰ روز دیگر تنظیم می‌شود.\n\n"
+        f"♾ برای **نامحدود** کردن، عدد `0` را بفرستید."
+    )
+    await safe_edit_message(update, txt, reply_markup=get_cancel_markup())
+    return EDIT_SERVER_EXPIRY
+
+async def edit_expiry_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        days = int(update.message.text)
+        sid = context.user_data.get('edit_expiry_sid')
+        if days > 0:
+            new_date = (datetime.now() + timedelta(days=days)).strftime('%Y-%m-%d')
+            msg = f"✅ تاریخ انقضا با موفقیت روی **{days} روز دیگر** تنظیم شد."
+        else:
+            new_date = None
+            msg = "✅ سرور با موفقیت **نامحدود (Lifetime)** شد."
+        db.update_server_expiry(sid, new_date)
+        await update.message.reply_text(msg)
+        await server_detail(update, context, custom_sid=sid)
+        return ConversationHandler.END
+    except ValueError:
+        await update.message.reply_text("❌ لطفاً فقط عدد انگلیسی وارد کنید.")
+        return EDIT_SERVER_EXPIRY
+
+async def ask_terminal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    sid = query.data.split('_')[2]
+    srv = db.get_server_by_id(sid)
+    context.user_data['term_sid'] = sid 
+    
+    kb = [[InlineKeyboardButton("🔙 خروج و بازگشت به پنل", callback_data='exit_terminal')]]
+    
+    txt = (
+        f"📟 **ترمینال تعاملی: {srv['name']}**\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"🟢 **اتصال برقرار شد.**\n"
+        f"هر دستوری بنویسی اجرا میشه. برای خروج دکمه پایین رو بزن.\n\n"
+        f"root@{srv['ip']}:~# _"
+    )
+    
+    await query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+    return GET_REMOTE_COMMAND
+
+async def run_terminal_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cmd = update.message.text
+    if cmd.lower() in ['exit', 'quit']:
+        return await close_terminal_session(update, context)
+
+    sid = context.user_data.get('term_sid')
+    srv = db.get_server_by_id(sid)
+    
+    wait_msg = await update.message.reply_text(f"⚙️ `{cmd}` ...")
+    
+    real_pass = sec.decrypt(srv['password'])
+    ok, output = await asyncio.get_running_loop().run_in_executor(None, ServerMonitor.run_remote_command, srv['ip'], srv['port'], srv['username'], real_pass, cmd)
+    
+    if not output: output = "[No Output]"
+    if len(output) > 3000: output = output[:3000] + "\n..."
+    safe_output = html.escape(output)
+    status = "✅" if ok else "❌"
+    
+    terminal_view = (
+        f"<code>root@{srv['ip']}:~# {cmd}</code>\n"
+        f"{status}\n"
+        f"<pre language='bash'>{safe_output}</pre>"
+    )
+    
+    kb = [[InlineKeyboardButton("🔙 خروج از ترمینال", callback_data='exit_terminal')]]
+    await wait_msg.delete()
+    try:
+        await update.message.reply_text(terminal_view, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(kb))
+    except:
+        await update.message.reply_text(f"⚠️ Raw Output:\n{output}", reply_markup=InlineKeyboardMarkup(kb))
+    
+    return GET_REMOTE_COMMAND
+
+async def close_terminal_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query: await update.callback_query.answer()
+    sid = context.user_data.get('term_sid')
+    await server_detail(update, context, custom_sid=sid)
+    return ConversationHandler.END
 
 # ==============================================================================
 # ⏳ SCHEDULED JOBS
@@ -2058,7 +2329,8 @@ def main():
     else:
         logger.error("JobQueue not available. Install python-telegram-bot[job-queue]")
     
-    app.run_polling()
+    # ⚠️ FIX CONFLICT: drop_pending_updates clears queue, close_loop handles restarts cleanly
+    app.run_polling(drop_pending_updates=True, close_loop=False)
 
 if __name__ == '__main__':
     main()
