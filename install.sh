@@ -7,11 +7,8 @@
 # --- Configuration ---
 INSTALL_DIR="/opt/radar-sonar"
 SERVICE_NAME="sonar-bot"
-# IMPORTANT: Pointing to the current directory assuming you have the files locally 
-# or update this to your git repo if needed. 
-# For this script, we assume we overwrite bot.py with local content or pull from git.
-# Since you provided the bot code directly, we will create the file manually in this script.
-REPO_URL="https://github.com/Amirtn9/radar-sonar.git" 
+REPO_URL="https://github.com/Amirtn9/radar-sonar.git"
+RAW_URL="https://raw.githubusercontent.com/Amirtn9/radar-sonar/main"
 
 # --- Colors & Styling ---
 RED='\033[0;31m'
@@ -47,8 +44,8 @@ fi
 # --- Dependencies Check (Whiptail) ---
 if ! command -v whiptail &> /dev/null; then
     echo -e "${YELLOW}📦 Installing necessary tools (whiptail)...${NC}"
-    apt-get update > /dev/null 2>&1
-    apt-get install -y whiptail > /dev/null 2>&1
+    apt-get update -y
+    apt-get install -y whiptail
 fi
 
 # ==============================================================================
@@ -59,61 +56,58 @@ fi
 function install_bot() {
     show_header
     
-    # Progress Bar for System Updates
+    # 1. Stop existing service if running
+    if systemctl is-active --quiet $SERVICE_NAME; then
+        systemctl stop $SERVICE_NAME
+        echo -e "${YELLOW}🛑 Stopped existing service.${NC}"
+    fi
+
+    # 2. Install System Dependencies
     {
         echo 10
         echo "XXX\nUpdating package lists...\nXXX"
-        apt-get update > /dev/null 2>&1
-        echo 40
-        echo "XXX\nInstalling Python & Git...\nXXX"
-        apt-get install -y python3 python3-pip python3-venv git > /dev/null 2>&1
-        echo 80
-        echo "XXX\nFinalizing dependencies...\nXXX"
-        sleep 1
-        echo 100
-    } | whiptail --title "System Update" --gauge "Preparing system environment..." 8 60 0
-
-    # Setup Directory
-    if [ ! -d "$INSTALL_DIR" ]; then
+        apt-get update -y > /dev/null 2>&1
+        
+        echo 30
+        echo "XXX\nInstalling Python, Git & Pip...\nXXX"
+        apt-get install -y python3 python3-pip python3-venv git curl > /dev/null 2>&1
+        
+        echo 50
+        echo "XXX\nCleaning old installation...\nXXX"
+        # Force remove directory to ensure fresh clone
+        rm -rf "$INSTALL_DIR"
         mkdir -p "$INSTALL_DIR"
-        echo -e "${GREEN}📂 Created directory: $INSTALL_DIR${NC}"
-    fi
+        
+        echo 60
+        echo "XXX\nDownloading repository...\nXXX"
+        # Try Git Clone first
+        if ! git clone "$REPO_URL" "$INSTALL_DIR" > /dev/null 2>&1; then
+            # Fallback to CURL if git fails
+            echo "XXX\nGit failed, using fallback download...\nXXX"
+            curl -s -o "$INSTALL_DIR/bot.py" "$RAW_URL/bot.py"
+            curl -s -o "$INSTALL_DIR/requirements.txt" "$RAW_URL/requirements.txt"
+        fi
 
-    # Create Python Virtual Environment
-    if [ ! -d "$INSTALL_DIR/venv" ]; then
-        whiptail --infobox "🐍 Creating Python Virtual Environment..." 8 50
+        echo 80
+        echo "XXX\nSetting up Python Environment...\nXXX"
         python3 -m venv "$INSTALL_DIR/venv"
+        source "$INSTALL_DIR/venv/bin/activate"
+        pip install --upgrade pip > /dev/null 2>&1
+        pip install -r "$INSTALL_DIR/requirements.txt" > /dev/null 2>&1
+        
+        echo 100
+    } | whiptail --title "Installation Progress" --gauge "Installing Sonar Radar..." 8 60 0
+
+    # 3. Verify Download
+    if [ ! -f "$INSTALL_DIR/bot.py" ]; then
+        whiptail --msgbox "❌ CRITICAL ERROR:\nFile 'bot.py' was not downloaded.\nCheck your internet connection or GitHub repository URL." 10 60
+        return
     fi
 
-    # Install Python Libraries
-    source "$INSTALL_DIR/venv/bin/activate"
-    whiptail --infobox "📥 Installing Python Libraries (This may take a while)..." 8 50
-    pip install --upgrade pip > /dev/null 2>&1
-    pip install python-telegram-bot[job-queue] requests paramiko cryptography jdatetime matplotlib > /dev/null 2>&1
-
-    # --- WRITE BOT CODE (Important Step) ---
-    # Since you provided the code, we write it directly to ensure it's the latest version.
-    whiptail --infobox "📝 Writing application code..." 8 50
-    
-    # NOTE: Ideally, you should curl this from a Gist or Repo. 
-    # For now, we assume the file 'bot.py' exists next to this script or we download it.
-    # Here we download the raw bot.py if you have uploaded it, otherwise we touch it.
-    # *Adjust this part to download YOUR specific bot.py content*
-    
-    # Option A: Download from your repo (Recommended)
-    if [ -d "$INSTALL_DIR/.git" ]; then
-        cd "$INSTALL_DIR" && git pull > /dev/null 2>&1
-    else
-        git clone "$REPO_URL" "$INSTALL_DIR" > /dev/null 2>&1
-    fi
-    
-    # Option B (Fallback): If you want to paste the code inside this script (Heredoc)
-    # You can uncomment the block below and paste the python code between EOFs if you don't use git.
-    
-    # Configure Bot
+    # 4. Configure Bot
     configure_bot_gui "install"
 
-    # Setup Systemd Service
+    # 5. Setup Systemd Service
     cat <<EOF > /etc/systemd/system/$SERVICE_NAME.service
 [Unit]
 Description=Sonar Radar Ultra Pro Bot
@@ -131,7 +125,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-    # Enable & Start
+    # 6. Enable & Start
     systemctl daemon-reload
     systemctl enable $SERVICE_NAME > /dev/null 2>&1
     systemctl restart $SERVICE_NAME
@@ -145,7 +139,7 @@ function configure_bot_gui() {
     CONFIG_FILE="$INSTALL_DIR/bot.py"
 
     if [ ! -f "$CONFIG_FILE" ]; then
-        whiptail --msgbox "❌ bot.py not found! Please install the bot first." 8 45
+        whiptail --msgbox "❌ bot.py not found! Please run 'Install' option first." 8 45
         return
     fi
 
@@ -169,26 +163,14 @@ function configure_bot_gui() {
 
 # 3. Uninstall Logic
 function uninstall_bot() {
-    if (whiptail --title "⚠️ DANGER ZONE" --yesno "Are you sure you want to completely REMOVE Sonar Radar?\n\nThis will delete:\n- All source codes\n- Database & Settings\n- System Service" 12 60); then
+    if (whiptail --title "⚠️ DANGER ZONE" --yesno "Are you sure you want to completely REMOVE Sonar Radar?" 10 60); then
         
-        {
-            echo 20
-            echo "XXX\nStopping service...\nXXX"
-            systemctl stop $SERVICE_NAME
-            systemctl disable $SERVICE_NAME > /dev/null 2>&1
-            
-            echo 50
-            echo "XXX\nRemoving systemd service...\nXXX"
-            rm -f /etc/systemd/system/$SERVICE_NAME.service
-            systemctl daemon-reload
-            
-            echo 80
-            echo "XXX\nDeleting files...\nXXX"
-            rm -rf "$INSTALL_DIR"
-            
-            echo 100
-        } | whiptail --gauge "Uninstalling..." 8 50 0
-
+        systemctl stop $SERVICE_NAME
+        systemctl disable $SERVICE_NAME > /dev/null 2>&1
+        rm -f /etc/systemd/system/$SERVICE_NAME.service
+        systemctl daemon-reload
+        rm -rf "$INSTALL_DIR"
+        
         whiptail --msgbox "🗑️ Uninstallation Complete." 8 40
     fi
 }
@@ -201,7 +183,7 @@ function view_logs() {
     journalctl -u $SERVICE_NAME -f -n 50
 }
 
-# 5. Database Status (New)
+# 5. Check Status
 function check_status() {
     STATUS=$(systemctl is-active $SERVICE_NAME)
     if [ "$STATUS" == "active" ]; then
@@ -211,13 +193,7 @@ function check_status() {
         ICON="🔴"
         MSG="Stopped"
     fi
-    
-    DB_SIZE="Unknown"
-    if [ -f "$INSTALL_DIR/sonar_ultra_pro.db" ]; then
-        DB_SIZE=$(du -h "$INSTALL_DIR/sonar_ultra_pro.db" | cut -f1)
-    fi
-
-    whiptail --msgbox "📊 Bot Status Information\n\n$ICON Service Status: $MSG\n💾 Database Size: $DB_SIZE\n📂 Install Path: $INSTALL_DIR" 12 50
+    whiptail --msgbox "📊 Status: $MSG $ICON" 8 40
 }
 
 # ==============================================================================
@@ -227,7 +203,7 @@ while true; do
     show_header
     
     OPTION=$(whiptail --title "🚀 Sonar Radar Manager" --menu "Choose an option:" 18 70 10 \
-    "1" "📥 Install / Update (Force Update)" \
+    "1" "📥 Install / Re-Install (Force Update)" \
     "2" "⚙️ Configure (Token & Admin ID)" \
     "3" "⏯️ Restart Bot" \
     "4" "🛑 Stop Bot" \
@@ -242,14 +218,8 @@ while true; do
     case $OPTION in
         1) install_bot ;;
         2) configure_bot_gui "menu" ;;
-        3) 
-            systemctl restart $SERVICE_NAME
-            whiptail --msgbox "🔄 Service Restarted." 8 30
-            ;;
-        4) 
-            systemctl stop $SERVICE_NAME
-            whiptail --msgbox "🛑 Service Stopped." 8 30
-            ;;
+        3) systemctl restart $SERVICE_NAME; whiptail --msgbox "✅ Restarted." 8 30 ;;
+        4) systemctl stop $SERVICE_NAME; whiptail --msgbox "🛑 Stopped." 8 30 ;;
         5) view_logs ;;
         6) check_status ;;
         7) uninstall_bot ;;
