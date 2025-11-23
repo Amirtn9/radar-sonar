@@ -38,8 +38,8 @@ from telegram.ext import (
 # ==============================================================================
 # ⚙️ CONFIGURATION & CONSTANTS
 # ==============================================================================
-TOKEN = 'Tokenbot'  # ⚠️ TOKEN
-SUPER_ADMIN_ID = 585858585                               # ⚠️ ADMIN ID
+TOKEN = '8089255042:AAHHqh1zJFHbj6_c5QUTPv_6thKHgNCg2NI'  # ⚠️ TOKEN
+SUPER_ADMIN_ID = 585214295                               # ⚠️ ADMIN ID
 DEFAULT_INTERVAL = 60
 DOWN_RETRY_LIMIT = 3
 DB_NAME = 'sonar_ultra_pro.db'
@@ -544,16 +544,29 @@ class ServerMonitor:
 
     @staticmethod
     def install_speedtest(ip, port, user, password):
-        cmd = "sudo apt-get update && (sudo apt-get install -y speedtest-cli || (sudo apt-get install -y python3-pip && pip3 install --upgrade speedtest-cli))"
-        return ServerMonitor.run_remote_command(ip, port, user, password, cmd, timeout=180)
+        # دستور نصب کاملاً خودکار و بدون پرسش
+        cmd = "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && (sudo DEBIAN_FRONTEND=noninteractive apt-get install -y speedtest-cli || (sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip && pip3 install --upgrade speedtest-cli))"
+        return ServerMonitor.run_remote_command(ip, port, user, password, cmd, timeout=300)
 
     @staticmethod
-    def run_speedtest(ip, port, user, password):
-        return ServerMonitor.run_remote_command(ip, port, user, password, "speedtest-cli --simple", timeout=90)
+    def repo_update(ip, port, user, password):
+        # فقط آپدیت لیست مخازن و آپگرید بسته‌های امنیتی (Safe Upgrade)
+        cmd = (
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && "
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
+        )
+        return ServerMonitor.run_remote_command(ip, port, user, password, cmd, timeout=300)
 
     @staticmethod
-    def clear_cache(ip, port, user, password):
-        return ServerMonitor.run_remote_command(ip, port, user, password, "sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'", timeout=30)
+    def full_system_update(ip, port, user, password):
+        # ارتقاء کامل و سنگین (Full Dist Upgrade) با حذف خودکار فایل‌های اضافه
+        cmd = (
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && "
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y -o Dpkg::Options::='--force-confdef' -o Dpkg::Options::='--force-confold' && "
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get autoremove -y && "
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get clean"
+        )
+        return ServerMonitor.run_remote_command(ip, port, user, password, cmd, timeout=900)
 
     @staticmethod
     def set_dns(ip, port, user, password, dns_type):
