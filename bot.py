@@ -796,10 +796,40 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     full_name = update.effective_user.full_name
+    username = update.effective_user.username or "ندارد"
     context.user_data.clear()
     loop = asyncio.get_running_loop()
-    # تغییر: مدت زمان پیش‌فرض اشتراک رایگان به 60 روز تغییر یافت
+
+    # --- اصلاح برای تشخیص کاربر جدید ---
+    # اول چک می‌کنیم کاربر توی دیتابیس هست یا نه
+    existing_user = await loop.run_in_executor(None, db.get_user, user_id)
+    is_new_user = False if existing_user else True
+    
+    # حالا آپدیت یا ایجاد می‌کنیم
     await loop.run_in_executor(None, db.add_or_update_user, user_id, full_name, 60)
+    
+    # --- سیستم خوش‌آمدگویی و اطلاع به ادمین (کد جدید) ---
+    if is_new_user:
+        # 1. اطلاع به ادمین
+        try:
+            admin_msg = (
+                "🔔 **کاربر جدید وارد شد!**\n"
+                f"👤 نام: {full_name}\n"
+                f"🆔 آیدی: `{user_id}`\n"
+                f"🏷 یوزرنیم: @{username}"
+            )
+            await context.bot.send_message(chat_id=SUPER_ADMIN_ID, text=admin_msg, parse_mode='Markdown')
+        except: pass # اگر ادمین ست نشده بود ارور نده
+
+        # 2. پیام خوش‌آمدگویی خاص (به عنوان پیام جداگانه یا پین شده)
+        await update.message.reply_text(
+            "🎉 **سلام رفیق، خوش اومدی!** \n\n"
+            "از حالا به بعد *رادار سونار* 📡 دستیار حرفه‌ای توست.\n"
+            "خیالت راحت، من هوای سرورها و سرویس‌هات رو دارم! 😎",
+            parse_mode='Markdown'
+        )
+    # -----------------------------------------------
+
     has_access, msg = await loop.run_in_executor(None, db.check_access, user_id)
     
     if not has_access:
@@ -814,6 +844,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("➕ سرور جدید", callback_data='add_server')],
         [InlineKeyboardButton("📋 لیست سرورها", callback_data='list_groups_for_servers'),
          InlineKeyboardButton("📊 داشبورد شبکه", callback_data='status_dashboard')],
+        [InlineKeyboardButton("🌍 تنظیمات همگانی سرورها", callback_data='global_ops_menu')], 
         [InlineKeyboardButton("🌍 چـک هـاسـت (Global)", callback_data='manual_ping_start')],
         [InlineKeyboardButton("⚙️ تنظیمات و هشدارها", callback_data='settings_menu')]
     ]
@@ -1969,8 +2000,8 @@ async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🎚 تنظیم آستانه هشدار (Resource)", callback_data='settings_thresholds')],
         [InlineKeyboardButton(f"🚨 هشدار قطعی سرور: {alert_icon}", callback_data=f'toggle_downalert_{"0" if down_alert=="1" else "1"}')],
         [
-            InlineKeyboardButton("🔄 آپدیت خودکار (Dev)", callback_data='dev_feature'),
-            InlineKeyboardButton("⚠️ ریبوت خودکار (Dev)", callback_data='dev_feature')
+            InlineKeyboardButton("🔄 تنظیم آپدیت خودکار", callback_data='auto_up_menu'),
+            InlineKeyboardButton("⚠️ تنظیم ریبوت خودکار", callback_data='auto_reboot_menu')
         ],
         [
             InlineKeyboardButton("📡 دریافت اطلاعات فوری (ارسال به کانال)", callback_data='send_instant_report')
@@ -2456,7 +2487,239 @@ async def check_server_down_logic(context, uid, s, res):
                     try: await context.bot.send_message(uid, rec_msg, parse_mode='Markdown')
                     except: pass
                 db.update_status(s['id'], "Online")
+# ==============================================================================
+# 🌍 GLOBAL OPERATIONS (NEW FEATURES)
+# ==============================================================================
 
+async def global_ops_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """نمایش منوی عملیات همگانی"""
+    kb = [
+        [InlineKeyboardButton("🔄 آپدیت مخازن (همه سرورها)", callback_data='glob_act_update')],
+        [InlineKeyboardButton("🧹 پاکسازی RAM (همه سرورها)", callback_data='glob_act_ram')],
+        [InlineKeyboardButton("🗑 پاکسازی دیسک (همه سرورها)", callback_data='glob_act_disk')],
+        [InlineKeyboardButton("🛠 سرویس کامل (Full Service)", callback_data='glob_act_full')],
+        # [InlineKeyboardButton("⏱ تنظیم زمان‌بندی (CronJob)", callback_data='glob_cron_setup')], # بعدا فعال میکنیم
+        [InlineKeyboardButton("🔙 بازگشت", callback_data='main_menu')]
+    ]
+    
+    txt = (
+        "🌍 **تنظیمات همگانی سرورها**\n\n"
+        "در این بخش می‌تونی یک دستور رو همزمان روی **تمام سرورهای فعال** اجرا کنی.\n"
+        "⚠️ نکته: عملیات ممکن است بسته به تعداد سرورها کمی طول بکشد."
+    )
+    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
+
+async def global_action_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """مدیریت درخواست‌های همگانی"""
+    query = update.callback_query
+    action = query.data.split('_')[2] # update, ram, disk, full
+    uid = update.effective_user.id
+    
+    # گرفتن لیست سرورهای فعال
+    servers = db.get_all_user_servers(uid)
+    active_servers = [s for s in servers if s['is_active']]
+    
+    if not active_servers:
+        await query.answer("❌ هیچ سرور فعالی نداری!", show_alert=True)
+        return
+
+    await query.message.reply_text(
+        f"⏳ **عملیات در حال اجرا روی {len(active_servers)} سرور...**\n"
+        "لطفاً منتظر بمانید، نتیجه نهایی ارسال خواهد شد."
+    )
+
+    # اجرای عملیات در پس‌زمینه
+    asyncio.create_task(run_global_commands_background(context, uid, active_servers, action))
+
+async def run_global_commands_background(context, chat_id, servers, action):
+    """تابع اجرایی که روی سرورها لوپ می‌زند"""
+    results = []
+    success_count = 0
+    fail_count = 0
+    
+    msg_header = ""
+    cmd = ""
+    
+    # تعیین دستور بر اساس انتخاب کاربر
+    if action == 'update':
+        msg_header = "🔄 **گزارش آپدیت همگانی**"
+        cmd = "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
+    elif action == 'ram':
+        msg_header = "🧹 **گزارش پاکسازی RAM**"
+        cmd = "sudo sync; sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'"
+    elif action == 'disk':
+        msg_header = "🗑 **گزارش پاکسازی دیسک**"
+        cmd = (
+            "sudo apt-get autoremove -y && "
+            "sudo apt-get autoclean -y && "
+            "sudo journalctl --vacuum-size=50M && "
+            "sudo rm -rf /tmp/*"
+        )
+    elif action == 'full':
+        msg_header = "🛠 **گزارش سرویس کامل (Full Service)**"
+        # ترکیب همه دستورات
+        cmd = (
+             "sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && "
+             "sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y && "
+             "sudo sync; sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' && "
+             "sudo apt-get autoremove -y && sudo apt-get autoclean -y"
+        )
+
+    # شروع عملیات روی سرورها
+    for srv in servers:
+        try:
+            # ارسال پیام وضعیت (آپدیت لحظه‌ای) - اختیاری برای جلوگیری از شلوغی کمترش کردیم
+            # await context.bot.send_message(chat_id, f"🔸 در حال پردازش: {srv['name']}...")
+            
+            # اتصال و اجرا
+            ok, output = await asyncio.get_running_loop().run_in_executor(
+                None, ServerMonitor.run_remote_command, 
+                srv['ip'], srv['port'], srv['username'], sec.decrypt(srv['password']), 
+                cmd, 600 # تایم اوت 10 دقیقه برای آپدیت
+            )
+            
+            if ok:
+                success_count += 1
+                results.append(f"✅ **{srv['name']}:** انجام شد.")
+            else:
+                fail_count += 1
+                results.append(f"❌ **{srv['name']}:** خطا\n`{str(output)[:50]}`") # فقط 50 کاراکتر اول خطا
+                
+        except Exception as e:
+            fail_count += 1
+            results.append(f"❌ **{srv['name']}:** خطای اتصال")
+
+    # ارسال گزارش نهایی
+    final_report = (
+        f"{msg_header}\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"📊 کل سرورها: {len(servers)}\n"
+        f"✅ موفق: {success_count} | ❌ ناموفق: {fail_count}\n\n"
+        + "\n".join(results)
+    )
+    
+    # چون متن ممکنه طولانی بشه، تیکه تیکه می‌فرستیم اگر لازم بود
+    if len(final_report) > 4000:
+        final_report = final_report[:4000] + "\n...(ادامه بریده شد)"
+        
+    await context.bot.send_message(chat_id=chat_id, text=final_report, parse_mode='Markdown')
+# ==============================================================================
+# ⏱ AUTO SCHEDULE HANDLERS (CRONJOBS)
+# ==============================================================================
+
+async def auto_update_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """منوی تنظیم زمان‌بندی آپدیت خودکار"""
+    uid = update.effective_user.id
+    curr = db.get_setting(uid, 'auto_update_hours') or '0'
+    
+    def st(val): return "✅" if str(val) == str(curr) else ""
+
+    kb = [
+        [InlineKeyboardButton(f"{st(24)} هر 24 ساعت", callback_data='set_autoup_24')],
+        [InlineKeyboardButton(f"{st(48)} هر 48 ساعت", callback_data='set_autoup_48')],
+        [InlineKeyboardButton(f"{st(168)} هر هفته (168 ساعت)", callback_data='set_autoup_168')],
+        [InlineKeyboardButton(f"{st(0)} ❌ غیرفعال", callback_data='set_autoup_0')],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data='settings_menu')]
+    ]
+    await safe_edit_message(update, "🔄 **تنظیمات آپدیت خودکار مخازن:**\n\nیکی از بازه‌های زمانی زیر را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb))
+
+async def auto_reboot_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """منوی تنظیم ریبوت خودکار"""
+    uid = update.effective_user.id
+    curr = db.get_setting(uid, 'auto_reboot_time') or 'OFF'
+    
+    # هشدار جدی
+    txt = (
+        "⚠️ **تنظیم ریبوت خودکار سرورها**\n\n"
+        "🔴 **هشدار:** ریبوت شدن سرور باعث قطع موقت اتصال کاربران می‌شود.\n"
+        "آیا مطمئن هستید که می‌خواهید تمام سرورها در ساعت مشخصی ریبوت شوند؟\n\n"
+        f"وضعیت فعلی: `{curr}`"
+    )
+    
+    kb = [
+        [InlineKeyboardButton("⏰ هر روز ساعت 04:00 صبح", callback_data='set_autoreb_04:00')],
+        [InlineKeyboardButton("⏰ هر روز ساعت 06:00 صبح", callback_data='set_autoreb_06:00')],
+        [InlineKeyboardButton("❌ غیرفعال سازی", callback_data='set_autoreb_OFF')],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data='settings_menu')]
+    ]
+    await safe_edit_message(update, txt, reply_markup=InlineKeyboardMarkup(kb))
+
+async def save_auto_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    uid = update.effective_user.id
+    
+    if 'set_autoup_' in data:
+        hours = data.split('_')[2]
+        db.set_setting(uid, 'auto_update_hours', hours)
+        # ذخیره زمان آخرین اجرا به عنوان شروع
+        db.set_setting(uid, 'last_auto_update_run', int(time.time()))
+        await query.answer(f"✅ آپدیت خودکار: {hours} ساعته تنظیم شد.")
+        await auto_update_menu(update, context)
+        
+    elif 'set_autoreb_' in data:
+        t_str = data.split('_')[2]
+        db.set_setting(uid, 'auto_reboot_time', t_str)
+        await query.answer(f"✅ ریبوت خودکار: {t_str} تنظیم شد.")
+        await auto_reboot_menu(update, context)
+
+# --- تابع اجرایی جاب (Job) ---
+async def auto_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
+    """این تابع هر دقیقه اجرا می‌شود و چک می‌کند آیا وقت عملیات رسیده؟"""
+    loop = asyncio.get_running_loop()
+    users = await loop.run_in_executor(None, db.get_all_users)
+    now = time.time()
+    
+    # زمان فعلی ایران برای چک کردن ساعت ریبوت
+    tehran_now = get_tehran_datetime()
+    current_hhmm = tehran_now.strftime("%H:%M")
+
+    for user in users:
+        uid = user['user_id']
+        
+        # 1. چک کردن آپدیت خودکار
+        up_interval = db.get_setting(uid, 'auto_update_hours')
+        if up_interval and up_interval != '0':
+            last_run = int(db.get_setting(uid, 'last_auto_update_run') or 0)
+            interval_sec = int(up_interval) * 3600
+            
+            if now - last_run > interval_sec:
+                # وقت آپدیت رسیده
+                servers = db.get_all_user_servers(uid)
+                active = [s for s in servers if s['is_active']]
+                if active:
+                    # اطلاع به کاربر
+                    try: await context.bot.send_message(uid, f"🔄 **شروع آپدیت خودکار ({up_interval} ساعته)...**")
+                    except: pass
+                    # اجرا
+                    asyncio.create_task(run_global_commands_background(context, uid, active, 'update'))
+                
+                # ثبت زمان اجرا
+                db.set_setting(uid, 'last_auto_update_run', int(now))
+
+        # 2. چک کردن ریبوت خودکار
+        reb_time = db.get_setting(uid, 'auto_reboot_time')
+        if reb_time and reb_time != 'OFF':
+            # برای جلوگیری از اجرای تکراری در همان دقیقه، یک فلگ چک می‌کنیم
+            last_reb_day = db.get_setting(uid, 'last_reboot_day')
+            today_str = tehran_now.strftime("%Y-%m-%d")
+            
+            if last_reb_day != today_str and current_hhmm == reb_time:
+                servers = db.get_all_user_servers(uid)
+                active = [s for s in servers if s['is_active']]
+                if active:
+                    try: await context.bot.send_message(uid, f"⚠️ **شروع ریبوت خودکار ({reb_time})...**")
+                    except: pass
+                    # دستور ریبوت
+                    for s in active:
+                        asyncio.create_task(
+                            run_background_ssh_task(
+                                context, uid, 
+                                ServerMonitor.run_remote_command, s['ip'], s['port'], s['username'], sec.decrypt(s['password']), "reboot"
+                            )
+                        )
+                
+                db.set_setting(uid, 'last_reboot_day', today_str)
 # ==============================================================================
 # 🚀 MAIN EXECUTION
 # ==============================================================================
@@ -2557,6 +2820,8 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_backup_get, pattern='^admin_backup_get$'))
     
     app.add_handler(CallbackQueryHandler(groups_menu, pattern='^groups_menu$'))
+    app.add_handler(CallbackQueryHandler(global_ops_menu, pattern='^global_ops_menu$'))
+    app.add_handler(CallbackQueryHandler(global_action_handler, pattern='^glob_act_'))
     app.add_handler(CallbackQueryHandler(delete_group_action, pattern='^delgroup_'))
     app.add_handler(CallbackQueryHandler(list_groups_for_servers, pattern='^list_groups_for_servers$'))
     app.add_handler(CallbackQueryHandler(show_servers, pattern='^(listsrv_|list_all)'))
@@ -2574,10 +2839,14 @@ def main():
     app.add_handler(CallbackQueryHandler(manage_servers_list, pattern='^manage_servers_list$'))
     app.add_handler(CallbackQueryHandler(toggle_server_active_action, pattern='^toggle_active_'))
     app.add_handler(CallbackQueryHandler(send_instant_channel_report, pattern='^send_instant_report$'))
-
+    
+    app.add_handler(CallbackQueryHandler(auto_update_menu, pattern='^auto_up_menu$'))
+    app.add_handler(CallbackQueryHandler(auto_reboot_menu, pattern='^auto_reboot_menu$'))
+    app.add_handler(CallbackQueryHandler(save_auto_schedule, pattern='^(set_autoup_|set_autoreb_)'))
     if app.job_queue:
         app.job_queue.run_daily(check_expiry_job, time=dt.time(hour=8, minute=30, second=0))
         app.job_queue.run_repeating(global_monitor_job, interval=DEFAULT_INTERVAL, first=10)
+        app.job_queue.run_repeating(auto_scheduler_job, interval=60, first=20)
     else:
         logger.error("JobQueue not available. Install python-telegram-bot[job-queue]")
     
