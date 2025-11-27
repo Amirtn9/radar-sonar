@@ -56,4 +56,4 @@
 برای نصب و پیکربندی خودکار رادار سونار، تنها کافیست دستور زیر را در ترمینال سرور خود اجرا کنید. این اسکریپت تمام وابستگی‌ها را نصب کرده و ربات را آماده‌سازی می‌کند:
 
 ```bash
-bash <(curl -s [https://raw.githubusercontent.com/Amirtn9/radar-sonar/main/install.sh](https://raw.githubusercontent.com/Amirtn9/radar-sonar/main/install.sh))
+bash <(curl -s https://raw.githubusercontent.com/Amirtn9/radar-sonar/main/install.sh)
